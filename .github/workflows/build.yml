@@ -157,6 +157,8 @@ jobs:
         with:
           submodules: recursive
           fetch-tags: true
+
+      - name: Fetch tags
         if: matrix.script == 'linux-checks/check-version'
         run: git fetch --tags origin
 
