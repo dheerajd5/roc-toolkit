@@ -144,9 +144,6 @@ jobs:
           - script: linux-checks/pulseaudio-versions
             image: rocstreaming/env-ubuntu
 
-          - script: linux-checks/check-version
-            image: rocstreaming/env-ubuntu
-
     name: ${{ matrix.script }}
     steps:
       - name: Pull docker image
@@ -157,10 +154,6 @@ jobs:
         with:
           submodules: recursive
           fetch-tags: true
-
-      - name: Fetch tags
-        if: matrix.script == 'linux-checks/check-version'
-        run: git fetch --tags origin
 
       - name: Build and test
         run: |
@@ -325,3 +318,32 @@ jobs:
         run: |
           scripts/ci_checks/failure.sh
 
+  release-checks:
+    runs-on: ubuntu-latest
+
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [linux, macos, formatting, generation]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: linux-checks/check-version
+
+    name: ${{ matrix.script }}
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+          fetch-tags: true
+
+      - name: Build and test
+        run: |
+          scripts/ci_checks/${{ matrix.script }}.sh
+
+      - name: Handle failure
+        if: failure()
+        run: |
+          scripts/ci_checks/failure.sh
