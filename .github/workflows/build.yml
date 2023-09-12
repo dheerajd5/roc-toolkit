@@ -326,7 +326,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - script: release-checks/version-check
+          - script: release-checks/check-version
 
     name: ${{ matrix.script }}
     steps:
