@@ -13,7 +13,7 @@
 #define ROC_SNDIO_ISOURCE_H_
 
 #include "roc_audio/iframe_reader.h"
-#include "roc_packet/ntp.h"
+#include "roc_core/time.h"
 #include "roc_sndio/idevice.h"
 
 namespace roc {
@@ -27,9 +27,9 @@ public:
     //! Adjust source clock to match consumer clock.
     //! @remarks
     //!  Invoked regularly after reading every or a several frames.
-    //!  @p timestamp defines the time in NTP domain when the last sample of the last
+    //!  @p timestamp defines the time in Unix domain when the last sample of the last
     //!  frame read from source is going to be actually processed by consumer.
-    virtual void reclock(packet::ntp_timestamp_t timestamp) = 0;
+    virtual void reclock(core::nanoseconds_t timestamp) = 0;
 };
 
 } // namespace sndio

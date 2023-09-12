@@ -12,7 +12,6 @@
 #include "roc_core/panic.h"
 #include "roc_core/time.h"
 #include "roc_fec/codec_map.h"
-#include "roc_packet/ntp.h"
 
 namespace roc {
 namespace pipeline {
@@ -204,19 +203,13 @@ ReceiverSession::ReceiverSession(
     areader = session_poisoner_.get();
 
     latency_monitor_.reset(new (latency_monitor_) audio::LatencyMonitor(
-        *source_queue_, *depacketizer_, resampler_reader_.get(),
+        *areader, *source_queue_, *depacketizer_, resampler_reader_.get(),
         session_config.latency_monitor, session_config.target_latency,
         format->sample_spec, common_config.output_sample_spec));
     if (!latency_monitor_ || !latency_monitor_->is_valid()) {
         return;
     }
-
-    e2e_latency_monitor_.reset(new (e2e_latency_monitor_)
-                                   audio::EndToEndLatencyMonitor(*areader));
-    if (!e2e_latency_monitor_) {
-        return;
-    }
-    areader = e2e_latency_monitor_.get();
+    areader = latency_monitor_.get();
 
     audio_reader_ = areader;
 }
@@ -241,37 +234,33 @@ bool ReceiverSession::handle(const packet::PacketPtr& packet) {
     return true;
 }
 
-bool ReceiverSession::advance(packet::timestamp_t timestamp) {
+bool ReceiverSession::refresh() {
     roc_panic_if(!is_valid());
 
     if (watchdog_) {
-        if (!watchdog_->update()) {
+        if (!watchdog_->is_alive()) {
             return false;
         }
     }
 
-    if (latency_monitor_) {
-        if (!latency_monitor_->update(timestamp)) {
-            return false;
-        }
+    if (!latency_monitor_->is_alive()) {
+        return false;
     }
 
     return true;
 }
 
-bool ReceiverSession::reclock(packet::ntp_timestamp_t) {
+bool ReceiverSession::reclock(core::nanoseconds_t timestamp) {
     roc_panic_if(!is_valid());
 
-    // no-op
-    return true;
+    return latency_monitor_->reclock(timestamp);
 }
 
 SessionStats ReceiverSession::stats() const {
-    SessionStats stats;
+    roc_panic_if(!is_valid());
 
-    if (e2e_latency_monitor_->has_latency()) {
-        stats.end_to_end_latency = e2e_latency_monitor_->latency();
-    }
+    SessionStats stats;
+    stats.latency = latency_monitor_->stats();
 
     return stats;
 }
@@ -285,9 +274,7 @@ audio::IFrameReader& ReceiverSession::reader() {
 void ReceiverSession::add_sending_metrics(const rtcp::SendingMetrics& metrics) {
     roc_panic_if(!is_valid());
 
-    const core::nanoseconds_t origin_unix = packet::ntp_2_unix(metrics.origin_ntp);
-
-    timestamp_injector_->update_mapping(origin_unix, metrics.origin_rtp);
+    timestamp_injector_->update_mapping(metrics.origin_time, metrics.origin_rtp);
 }
 
 void ReceiverSession::add_link_metrics(const rtcp::LinkMetrics& metrics) {

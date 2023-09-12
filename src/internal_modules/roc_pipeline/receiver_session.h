@@ -15,7 +15,6 @@
 #include "roc_address/socket_addr.h"
 #include "roc_audio/channel_mapper_reader.h"
 #include "roc_audio/depacketizer.h"
-#include "roc_audio/e2e_latency_monitor.h"
 #include "roc_audio/iframe_decoder.h"
 #include "roc_audio/iframe_reader.h"
 #include "roc_audio/iresampler.h"
@@ -76,15 +75,15 @@ public:
     //!  true if the packet is dedicated for this session
     bool handle(const packet::PacketPtr& packet);
 
-    //! Advance session timestamp.
+    //! Refresh session status.
     //! @returns
     //!  false if the session is ended
-    bool advance(packet::timestamp_t timestamp);
+    bool refresh();
 
     //! Adjust session clock to match consumer clock.
     //! @returns
     //!  false if the session is ended
-    bool reclock(packet::ntp_timestamp_t timestamp);
+    bool reclock(core::nanoseconds_t timestamp);
 
     //! Get recent latency statistics.
     SessionStats stats() const;
@@ -134,7 +133,6 @@ private:
     core::Optional<audio::PoisonReader> session_poisoner_;
 
     core::Optional<audio::LatencyMonitor> latency_monitor_;
-    core::Optional<audio::EndToEndLatencyMonitor> e2e_latency_monitor_;
 };
 
 } // namespace pipeline

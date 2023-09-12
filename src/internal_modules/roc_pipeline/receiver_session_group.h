@@ -45,11 +45,11 @@ public:
     //! Route packet to session.
     void route_packet(const packet::PacketPtr& packet);
 
-    //! Advance session timestamp.
-    void advance_sessions(packet::timestamp_t timestamp);
+    //! Refresh sessions statuses.
+    void refresh_sessions();
 
     //! Adjust session clock to match consumer clock.
-    void reclock_sessions(packet::ntp_timestamp_t timestamp);
+    void reclock_sessions(core::nanoseconds_t timestamp);
 
     //! Get number of alive sessions.
     size_t num_sessions() const;

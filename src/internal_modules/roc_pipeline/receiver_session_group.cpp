@@ -45,20 +45,20 @@ void ReceiverSessionGroup::route_packet(const packet::PacketPtr& packet) {
     route_transport_packet_(packet);
 }
 
-void ReceiverSessionGroup::advance_sessions(packet::timestamp_t timestamp) {
+void ReceiverSessionGroup::refresh_sessions() {
     core::SharedPtr<ReceiverSession> curr, next;
 
     for (curr = sessions_.front(); curr; curr = next) {
         next = sessions_.nextof(*curr);
 
-        if (!curr->advance(timestamp)) {
+        if (!curr->refresh()) {
             // Session ended.
             remove_session_(*curr);
         }
     }
 }
 
-void ReceiverSessionGroup::reclock_sessions(packet::ntp_timestamp_t timestamp) {
+void ReceiverSessionGroup::reclock_sessions(core::nanoseconds_t timestamp) {
     core::SharedPtr<ReceiverSession> curr, next;
 
     for (curr = sessions_.front(); curr; curr = next) {
@@ -101,6 +101,7 @@ ReceiverSessionGroup::on_get_reception_metrics(size_t source_index) {
 void ReceiverSessionGroup::on_add_sending_metrics(const rtcp::SendingMetrics& metrics) {
     core::SharedPtr<ReceiverSession> sess;
 
+    // TODO: match session by SSRC/CNAME
     for (sess = sessions_.front(); sess; sess = sessions_.nextof(*sess)) {
         sess->add_sending_metrics(metrics);
     }
@@ -109,6 +110,7 @@ void ReceiverSessionGroup::on_add_sending_metrics(const rtcp::SendingMetrics& me
 void ReceiverSessionGroup::on_add_link_metrics(const rtcp::LinkMetrics& metrics) {
     core::SharedPtr<ReceiverSession> sess;
 
+    // TODO: match session by SSRC/CNAME
     for (sess = sessions_.front(); sess; sess = sessions_.nextof(*sess)) {
         sess->add_link_metrics(metrics);
     }
