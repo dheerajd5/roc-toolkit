@@ -322,7 +322,6 @@ jobs:
     runs-on: ubuntu-latest
 
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: [linux, macos, formatting, generation]
 
     strategy:
       fail-fast: false
