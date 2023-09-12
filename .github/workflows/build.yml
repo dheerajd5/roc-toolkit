@@ -338,7 +338,7 @@ jobs:
 
       - name: Build and test
         run: |
-          scripts/ci_checks/release-checks/${{ matrix.script }}.sh
+          scripts/ci_checks/${{ matrix.script }}.sh
 
       - name: Handle failure
         if: failure()
