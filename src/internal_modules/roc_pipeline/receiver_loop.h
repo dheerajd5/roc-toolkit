@@ -19,6 +19,7 @@
 #include "roc_core/stddefs.h"
 #include "roc_packet/packet_factory.h"
 #include "roc_pipeline/config.h"
+#include "roc_pipeline/metrics.h"
 #include "roc_pipeline/pipeline_loop.h"
 #include "roc_pipeline/receiver_source.h"
 #include "roc_sndio/isource.h"
@@ -57,10 +58,13 @@ public:
 
         bool (ReceiverLoop::*func_)(Task&); //!< Task implementation method.
 
-        ReceiverSlot* slot_;       //!< Slot.
-        address::Interface iface_; //!< Interface.
-        address::Protocol proto_;  //!< Protocol.
-        packet::IWriter* writer_;  //!< Packet writer.
+        ReceiverSlot* slot_;                   //!< Slot.
+        address::Interface iface_;             //!< Interface.
+        address::Protocol proto_;              //!< Protocol.
+        packet::IWriter* writer_;              //!< Packet writer.
+        ReceiverSlotMetrics* slot_metrics_;    //!< Output for slot metrics.
+        ReceiverSessionMetrics* sess_metrics_; //!< Output for session metrics.
+        size_t* sess_metrics_size_;            //!< Input/output session metrics size.
     };
 
     //! Subclasses for specific tasks.
@@ -81,6 +85,18 @@ public:
         public:
             //! Set task parameters.
             DeleteSlot(SlotHandle slot);
+        };
+
+        //! Query slot metrics.
+        class QuerySlot : public Task {
+        public:
+            //! Set task parameters.
+            //! @remarks
+            //!  Metrics are written to provided structs.
+            QuerySlot(SlotHandle slot,
+                      ReceiverSlotMetrics& slot_metrics,
+                      ReceiverSessionMetrics* sess_metrics,
+                      size_t* sess_metrics_size);
         };
 
         //! Create endpoint on given interface of the slot.
@@ -127,26 +143,30 @@ private:
     virtual bool restart();
     virtual audio::SampleSpec sample_spec() const;
     virtual core::nanoseconds_t latency() const;
+    virtual bool has_latency() const;
     virtual bool has_clock() const;
-    virtual void reclock(packet::ntp_timestamp_t timestamp);
+    virtual void reclock(core::nanoseconds_t timestamp);
     virtual bool read(audio::Frame&);
 
     // Methods of PipelineLoop
     virtual core::nanoseconds_t timestamp_imp() const;
+    virtual uint64_t tid_imp() const;
     virtual bool process_subframe_imp(audio::Frame& frame);
     virtual bool process_task_imp(PipelineTask& task);
 
     // Methods for tasks
     bool task_create_slot_(Task& task);
     bool task_delete_slot_(Task& task);
+    bool task_query_slot_(Task& task);
     bool task_add_endpoint_(Task& task);
 
     ReceiverSource source_;
+    core::Mutex source_mutex_;
 
     core::Optional<core::Ticker> ticker_;
-    packet::timestamp_t timestamp_;
+    core::Ticker::ticks_t ticker_ts_;
 
-    core::Mutex source_mutex_;
+    bool auto_reclock_;
 
     bool valid_;
 };

@@ -8,6 +8,7 @@
 
 #include <CppUTest/TestHarness.h>
 
+#include "roc_core/macro_helpers.h"
 #include "roc_core/stddefs.h"
 
 #include "roc/config.h"
@@ -395,6 +396,30 @@ TEST(receiver, bad_args) {
 
         LONGS_EQUAL(0, roc_receiver_close(receiver));
     }
+    { // query
+        roc_receiver* receiver = NULL;
+        CHECK(roc_receiver_open(context, &receiver_config, &receiver) == 0);
+
+        roc_endpoint* source_endpoint = NULL;
+        CHECK(roc_endpoint_allocate(&source_endpoint) == 0);
+        CHECK(roc_endpoint_set_uri(source_endpoint, "rtp://127.0.0.1:0") == 0);
+
+        CHECK(roc_receiver_bind(receiver, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_SOURCE,
+                                source_endpoint)
+              == 0);
+
+        roc_receiver_metrics metrics;
+        memset(&metrics, 0, sizeof(metrics));
+
+        CHECK(roc_receiver_query(NULL, ROC_SLOT_DEFAULT, &metrics) == -1);
+        CHECK(roc_receiver_query(receiver, 999, &metrics) == -1);
+        CHECK(roc_receiver_query(receiver, ROC_SLOT_DEFAULT, NULL) == -1);
+
+        CHECK(roc_receiver_query(receiver, ROC_SLOT_DEFAULT, &metrics) == 0);
+
+        CHECK(roc_endpoint_deallocate(source_endpoint) == 0);
+        LONGS_EQUAL(0, roc_receiver_close(receiver));
+    }
     { // unlink
         roc_receiver* receiver = NULL;
         CHECK(roc_receiver_open(context, &receiver_config, &receiver) == 0);
@@ -505,6 +530,70 @@ TEST(receiver, bad_config) {
         CHECK(roc_receiver_open(context, &receiver_config_copy, &receiver) != 0);
         CHECK(!receiver);
     }
+}
+
+TEST(receiver, read_args) {
+    roc_receiver* receiver = NULL;
+    CHECK(roc_receiver_open(context, &receiver_config, &receiver) == 0);
+
+    float samples[16] = {};
+
+    { // all good, not bound
+        roc_frame frame;
+        frame.samples = samples;
+        frame.samples_size = ROC_ARRAY_SIZE(samples);
+        CHECK(roc_receiver_read(receiver, &frame) == 0);
+    }
+
+    roc_endpoint* source_endpoint = NULL;
+    CHECK(roc_endpoint_allocate(&source_endpoint) == 0);
+    CHECK(roc_endpoint_set_uri(source_endpoint, "rtp://127.0.0.1:0") == 0);
+
+    CHECK(roc_receiver_bind(receiver, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_SOURCE,
+                            source_endpoint)
+          == 0);
+
+    { // all good, bound
+        roc_frame frame;
+        frame.samples = samples;
+        frame.samples_size = ROC_ARRAY_SIZE(samples);
+        CHECK(roc_receiver_read(receiver, &frame) == 0);
+    }
+
+    { // null receiver
+        roc_frame frame;
+        frame.samples = samples;
+        frame.samples_size = ROC_ARRAY_SIZE(samples);
+        CHECK(roc_receiver_read(NULL, &frame) == -1);
+    }
+
+    { // null frame
+        CHECK(roc_receiver_read(receiver, NULL) == -1);
+    }
+
+    { // null samples, zero sample count
+        roc_frame frame;
+        frame.samples = NULL;
+        frame.samples_size = 0;
+        CHECK(roc_receiver_read(receiver, &frame) == 0);
+    }
+
+    { // null samples, non-zero sample count
+        roc_frame frame;
+        frame.samples = NULL;
+        frame.samples_size = ROC_ARRAY_SIZE(samples);
+        CHECK(roc_receiver_read(receiver, &frame) == -1);
+    }
+
+    { // uneven sample count
+        roc_frame frame;
+        frame.samples = samples;
+        frame.samples_size = 1;
+        CHECK(roc_receiver_read(receiver, &frame) == -1);
+    }
+
+    CHECK(roc_endpoint_deallocate(source_endpoint) == 0);
+    LONGS_EQUAL(0, roc_receiver_close(receiver));
 }
 
 } // namespace api

@@ -8,9 +8,11 @@
 
 #include <CppUTest/TestHarness.h>
 
+#include "test_helpers/control_writer.h"
 #include "test_helpers/frame_reader.h"
 #include "test_helpers/packet_writer.h"
 
+#include "roc_address/interface.h"
 #include "roc_core/atomic.h"
 #include "roc_core/buffer_factory.h"
 #include "roc_core/heap_arena.h"
@@ -96,29 +98,31 @@ TEST_GROUP(receiver_source) {
         config.common.enable_profiling = true;
 
         config.default_session.latency_monitor.fe_enable = false;
-        config.default_session.target_latency = Latency * core::Second / SampleRate;
+        config.default_session.target_latency =
+            Latency * core::Second / (int)output_sample_spec.sample_rate();
 
         config.default_session.latency_monitor.min_latency =
-            -Timeout * 10 * core::Second / SampleRate;
+            -Timeout * 10 * core::Second / (int)output_sample_spec.sample_rate();
         config.default_session.latency_monitor.max_latency =
-            +Timeout * 10 * core::Second / SampleRate;
+            +Timeout * 10 * core::Second / (int)output_sample_spec.sample_rate();
 
         config.default_session.watchdog.no_playback_timeout =
-            Timeout * core::Second / SampleRate;
+            Timeout * core::Second / (int)output_sample_spec.sample_rate();
 
         config.default_session.rtp_validator.max_sn_jump = MaxSnJump;
         config.default_session.rtp_validator.max_ts_jump =
-            MaxTsJump * core::Second / SampleRate;
+            MaxTsJump * core::Second / (int)output_sample_spec.sample_rate();
 
         return config;
     }
 
-    void init(audio::ChannelMask output_channels, audio::ChannelMask packet_channels) {
-        output_sample_spec.set_sample_rate(SampleRate);
+    void init(int output_sample_rate, audio::ChannelMask output_channels,
+              int packet_sample_rate, audio::ChannelMask packet_channels) {
+        output_sample_spec.set_sample_rate((size_t)output_sample_rate);
         output_sample_spec.channel_set().set_layout(audio::ChanLayout_Surround);
         output_sample_spec.channel_set().set_channel_mask(output_channels);
 
-        packet_sample_spec.set_sample_rate(SampleRate);
+        packet_sample_spec.set_sample_rate((size_t)packet_sample_rate);
         packet_sample_spec.channel_set().set_layout(audio::ChanLayout_Surround);
         packet_sample_spec.channel_set().set_channel_mask(packet_channels);
 
@@ -134,32 +138,31 @@ TEST_GROUP(receiver_source) {
 };
 
 TEST(receiver_source, no_sessions) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     test::FrameReader frame_reader(receiver, sample_buffer_factory);
 
     for (size_t nf = 0; nf < ManyPackets * FramesPerPacket; nf++) {
-        frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+        receiver.refresh(frame_reader.refresh_ts());
+        frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
 
         UNSIGNED_LONGS_EQUAL(0, receiver.num_sessions());
     }
 }
 
 TEST(receiver_source, one_session) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -180,6 +183,7 @@ TEST(receiver_source, one_session) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -190,13 +194,12 @@ TEST(receiver_source, one_session) {
 }
 
 TEST(receiver_source, one_session_long_run) {
-    enum { Chans = Chans_Stereo, NumIterations = 10 };
+    enum { Rate = SampleRate, Chans = Chans_Stereo, NumIterations = 10 };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -218,6 +221,7 @@ TEST(receiver_source, one_session_long_run) {
     for (size_t ni = 0; ni < NumIterations; ni++) {
         for (size_t np = 0; np < ManyPackets; np++) {
             for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+                receiver.refresh(frame_reader.refresh_ts());
                 frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
                 UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -229,13 +233,12 @@ TEST(receiver_source, one_session_long_run) {
 }
 
 TEST(receiver_source, initial_latency) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -255,7 +258,8 @@ TEST(receiver_source, initial_latency) {
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
 
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
-            frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
         }
 
         UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -265,6 +269,7 @@ TEST(receiver_source, initial_latency) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
 
@@ -273,13 +278,12 @@ TEST(receiver_source, initial_latency) {
 }
 
 TEST(receiver_source, initial_latency_timeout) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -299,25 +303,26 @@ TEST(receiver_source, initial_latency_timeout) {
 
     for (size_t np = 0; np < Timeout / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
-            frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
         }
 
         UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
     }
 
-    frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+    receiver.refresh(frame_reader.refresh_ts());
+    frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
 
     UNSIGNED_LONGS_EQUAL(0, receiver.num_sessions());
 }
 
 TEST(receiver_source, timeout) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -338,6 +343,7 @@ TEST(receiver_source, timeout) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
 
@@ -345,18 +351,18 @@ TEST(receiver_source, timeout) {
     }
 
     while (receiver.num_sessions() != 0) {
-        frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+        receiver.refresh(frame_reader.refresh_ts());
+        frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
     }
 }
 
 TEST(receiver_source, initial_trim) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -379,6 +385,7 @@ TEST(receiver_source, initial_trim) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -389,13 +396,12 @@ TEST(receiver_source, initial_trim) {
 }
 
 TEST(receiver_source, two_sessions_synchronous) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -422,6 +428,7 @@ TEST(receiver_source, two_sessions_synchronous) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 2, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(2, receiver.num_sessions());
@@ -433,13 +440,12 @@ TEST(receiver_source, two_sessions_synchronous) {
 }
 
 TEST(receiver_source, two_sessions_overlapping) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -460,6 +466,7 @@ TEST(receiver_source, two_sessions_overlapping) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -478,6 +485,7 @@ TEST(receiver_source, two_sessions_overlapping) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 2, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(2, receiver.num_sessions());
@@ -489,13 +497,12 @@ TEST(receiver_source, two_sessions_overlapping) {
 }
 
 TEST(receiver_source, two_sessions_two_endpoints) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot1 = create_slot(receiver);
@@ -529,6 +536,7 @@ TEST(receiver_source, two_sessions_two_endpoints) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 2, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(2, receiver.num_sessions());
@@ -540,13 +548,12 @@ TEST(receiver_source, two_sessions_two_endpoints) {
 }
 
 TEST(receiver_source, two_sessions_same_address_same_stream) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -578,6 +585,7 @@ TEST(receiver_source, two_sessions_same_address_same_stream) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -589,13 +597,12 @@ TEST(receiver_source, two_sessions_same_address_same_stream) {
 }
 
 TEST(receiver_source, two_sessions_same_address_different_streams) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -629,6 +636,7 @@ TEST(receiver_source, two_sessions_same_address_different_streams) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -640,13 +648,12 @@ TEST(receiver_source, two_sessions_same_address_different_streams) {
 }
 
 TEST(receiver_source, seqnum_overflow) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -668,6 +675,7 @@ TEST(receiver_source, seqnum_overflow) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -675,13 +683,12 @@ TEST(receiver_source, seqnum_overflow) {
 }
 
 TEST(receiver_source, seqnum_small_jump) {
-    enum { Chans = Chans_Stereo, SmallJump = 5 };
+    enum { Rate = SampleRate, Chans = Chans_Stereo, SmallJump = 5 };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -702,6 +709,7 @@ TEST(receiver_source, seqnum_small_jump) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -711,6 +719,7 @@ TEST(receiver_source, seqnum_small_jump) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -718,13 +727,12 @@ TEST(receiver_source, seqnum_small_jump) {
 }
 
 TEST(receiver_source, seqnum_large_jump) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -745,6 +753,7 @@ TEST(receiver_source, seqnum_large_jump) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -754,24 +763,29 @@ TEST(receiver_source, seqnum_large_jump) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
     }
 
     while (receiver.num_sessions() != 0) {
-        frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+        receiver.refresh(frame_reader.refresh_ts());
+        frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
     }
 }
 
 TEST(receiver_source, seqnum_reorder) {
-    enum { Chans = Chans_Stereo, ReorderWindow = Latency / SamplesPerPacket };
+    enum {
+        Rate = SampleRate,
+        Chans = Chans_Stereo,
+        ReorderWindow = Latency / SamplesPerPacket
+    };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -792,6 +806,7 @@ TEST(receiver_source, seqnum_reorder) {
     for (size_t ni = 0; ni < ManyPackets / ReorderWindow; ni++) {
         if (pos >= Latency / SamplesPerPacket) {
             for (size_t nf = 0; nf < ReorderWindow * FramesPerPacket; nf++) {
+                receiver.refresh(frame_reader.refresh_ts());
                 frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
             }
         }
@@ -806,13 +821,12 @@ TEST(receiver_source, seqnum_reorder) {
 }
 
 TEST(receiver_source, seqnum_late) {
-    enum { Chans = Chans_Stereo, DelayedPackets = 5 };
+    enum { Rate = SampleRate, Chans = Chans_Stereo, DelayedPackets = 5 };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -834,6 +848,7 @@ TEST(receiver_source, seqnum_late) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -841,12 +856,14 @@ TEST(receiver_source, seqnum_late) {
 
     for (size_t np = 0; np < DelayedPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
         }
     }
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -857,21 +874,22 @@ TEST(receiver_source, seqnum_late) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
     }
 
+    receiver.refresh(frame_reader.refresh_ts());
     frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
 }
 
 TEST(receiver_source, timestamp_overflow) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -895,6 +913,7 @@ TEST(receiver_source, timestamp_overflow) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -902,13 +921,12 @@ TEST(receiver_source, timestamp_overflow) {
 }
 
 TEST(receiver_source, timestamp_small_jump) {
-    enum { Chans = Chans_Stereo, ShiftedPackets = 5 };
+    enum { Rate = SampleRate, Chans = Chans_Stereo, ShiftedPackets = 5 };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -932,6 +950,7 @@ TEST(receiver_source, timestamp_small_jump) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -939,6 +958,7 @@ TEST(receiver_source, timestamp_small_jump) {
 
     for (size_t np = 0; np < ShiftedPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -946,6 +966,7 @@ TEST(receiver_source, timestamp_small_jump) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -953,13 +974,12 @@ TEST(receiver_source, timestamp_small_jump) {
 }
 
 TEST(receiver_source, timestamp_large_jump) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -983,24 +1003,29 @@ TEST(receiver_source, timestamp_large_jump) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
     }
 
     while (receiver.num_sessions() != 0) {
-        frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+        receiver.refresh(frame_reader.refresh_ts());
+        frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
     }
 }
 
 TEST(receiver_source, timestamp_overlap) {
-    enum { Chans = Chans_Stereo, OverlappedSamples = SamplesPerPacket / 2 };
+    enum {
+        Rate = SampleRate,
+        Chans = Chans_Stereo,
+        OverlappedSamples = SamplesPerPacket / 2
+    };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1024,6 +1049,7 @@ TEST(receiver_source, timestamp_overlap) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -1031,13 +1057,12 @@ TEST(receiver_source, timestamp_overlap) {
 }
 
 TEST(receiver_source, timestamp_reorder) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1058,6 +1083,7 @@ TEST(receiver_source, timestamp_reorder) {
 
     for (ssize_t np = Latency / SamplesPerPacket - 1; np >= 0; np--) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
 
@@ -1074,6 +1100,7 @@ TEST(receiver_source, timestamp_reorder) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket - 1; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -1081,6 +1108,7 @@ TEST(receiver_source, timestamp_reorder) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -1088,13 +1116,12 @@ TEST(receiver_source, timestamp_reorder) {
 }
 
 TEST(receiver_source, timestamp_late) {
-    enum { Chans = Chans_Stereo, DelayedPackets = 5 };
+    enum { Rate = SampleRate, Chans = Chans_Stereo, DelayedPackets = 5 };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1118,6 +1145,7 @@ TEST(receiver_source, timestamp_late) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -1125,12 +1153,14 @@ TEST(receiver_source, timestamp_late) {
 
     for (size_t np = 0; np < DelayedPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
         }
     }
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
@@ -1143,26 +1173,28 @@ TEST(receiver_source, timestamp_late) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
     }
 
+    receiver.refresh(frame_reader.refresh_ts());
     frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
 }
 
 TEST(receiver_source, packet_size_small) {
     enum {
+        Rate = SampleRate,
         Chans = Chans_Stereo,
         SmallPacketsPerFrame = 2,
         SamplesPerSmallPacket = SamplesPerFrame / SmallPacketsPerFrame,
         ManySmallPackets = Latency / SamplesPerSmallPacket * 10
     };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1182,6 +1214,7 @@ TEST(receiver_source, packet_size_small) {
                                 packet_sample_spec);
 
     for (size_t nf = 0; nf < ManySmallPackets / SmallPacketsPerFrame; nf++) {
+        receiver.refresh(frame_reader.refresh_ts());
         frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         for (size_t np = 0; np < SmallPacketsPerFrame; np++) {
             packet_writer.write_packets(1, SamplesPerSmallPacket, packet_sample_spec);
@@ -1191,17 +1224,17 @@ TEST(receiver_source, packet_size_small) {
 
 TEST(receiver_source, packet_size_large) {
     enum {
+        Rate = SampleRate,
         Chans = Chans_Stereo,
         FramesPerLargePacket = 2,
         SamplesPerLargePacket = SamplesPerFrame * FramesPerLargePacket,
         ManyLargePackets = Latency / SamplesPerLargePacket * 10
     };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1222,6 +1255,7 @@ TEST(receiver_source, packet_size_large) {
 
     for (size_t np = 0; np < ManyLargePackets; np++) {
         for (size_t nf = 0; nf < FramesPerLargePacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
         packet_writer.write_packets(1, SamplesPerLargePacket, packet_sample_spec);
@@ -1230,6 +1264,7 @@ TEST(receiver_source, packet_size_large) {
 
 TEST(receiver_source, packet_size_variable) {
     enum {
+        Rate = SampleRate,
         Chans = Chans_Stereo,
 
         SmallPacketsPerFrame = 2,
@@ -1243,11 +1278,10 @@ TEST(receiver_source, packet_size_variable) {
         NumIterations = Latency / SamplesPerTwoPackets * 10
     };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1267,6 +1301,7 @@ TEST(receiver_source, packet_size_variable) {
 
     for (size_t ni = 0; ni < NumIterations; ni++) {
         for (; available >= Latency; available -= SamplesPerFrame) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
         }
 
@@ -1278,13 +1313,12 @@ TEST(receiver_source, packet_size_variable) {
 }
 
 TEST(receiver_source, corrupted_packets_new_session) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1307,7 +1341,8 @@ TEST(receiver_source, corrupted_packets_new_session) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
-            frame_reader.skip_zeros(SamplesPerFrame, output_sample_spec);
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_zero_samples(SamplesPerFrame, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(0, receiver.num_sessions());
         }
@@ -1317,13 +1352,12 @@ TEST(receiver_source, corrupted_packets_new_session) {
 }
 
 TEST(receiver_source, corrupted_packets_existing_session) {
-    enum { Chans = Chans_Stereo };
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(Rate, Chans, Rate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1345,6 +1379,7 @@ TEST(receiver_source, corrupted_packets_existing_session) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -1357,6 +1392,7 @@ TEST(receiver_source, corrupted_packets_existing_session) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 0, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -1367,6 +1403,7 @@ TEST(receiver_source, corrupted_packets_existing_session) {
 
     for (size_t np = 0; np < Latency / SamplesPerPacket; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -1376,14 +1413,13 @@ TEST(receiver_source, corrupted_packets_existing_session) {
     }
 }
 
-TEST(receiver_source, channels_stereo_to_mono) {
-    enum { OutputChans = Chans_Mono, PacketChans = Chans_Stereo };
+TEST(receiver_source, channel_mapping_stereo_to_mono) {
+    enum { Rate = SampleRate, OutputChans = Chans_Mono, PacketChans = Chans_Stereo };
 
-    init(OutputChans, PacketChans);
+    init(Rate, OutputChans, Rate, PacketChans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1404,6 +1440,7 @@ TEST(receiver_source, channels_stereo_to_mono) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -1413,14 +1450,13 @@ TEST(receiver_source, channels_stereo_to_mono) {
     }
 }
 
-TEST(receiver_source, channels_mono_to_stereo) {
-    enum { OutputChans = Chans_Stereo, PacketChans = Chans_Mono };
+TEST(receiver_source, channel_mapping_mono_to_stereo) {
+    enum { Rate = SampleRate, OutputChans = Chans_Stereo, PacketChans = Chans_Mono };
 
-    init(OutputChans, PacketChans);
+    init(Rate, OutputChans, Rate, PacketChans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
-
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1441,6 +1477,7 @@ TEST(receiver_source, channels_mono_to_stereo) {
 
     for (size_t np = 0; np < ManyPackets; np++) {
         for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
             frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec);
 
             UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
@@ -1450,14 +1487,643 @@ TEST(receiver_source, channels_mono_to_stereo) {
     }
 }
 
-TEST(receiver_source, state) {
-    enum { Chans = Chans_Stereo };
+TEST(receiver_source, sample_rate_mapping) {
+    enum { OutputRate = 48000, PacketRate = 44100, Chans = Chans_Stereo };
 
-    init(Chans, Chans);
+    init(OutputRate, Chans, PacketRate, Chans);
 
     ReceiverSource receiver(make_config(), format_map, packet_factory,
                             byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
 
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* endpoint1_writer =
+        create_endpoint(slot, address::Iface_AudioSource, proto1);
+    CHECK(endpoint1_writer);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *endpoint1_writer, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                packet_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_nonzero_samples(SamplesPerFrame * OutputRate / PacketRate
+                                                  / output_sample_spec.num_channels()
+                                                  * output_sample_spec.num_channels(),
+                                              output_sample_spec);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
+    }
+}
+
+TEST(receiver_source, timestamp_mapping_no_control_packets) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* packet_endpoint =
+        create_endpoint(slot, address::Iface_AudioSource, address::Proto_RTP);
+    CHECK(packet_endpoint);
+
+    packet::IWriter* control_endpoint =
+        create_endpoint(slot, address::Iface_AudioControl, address::Proto_RTCP);
+    CHECK(control_endpoint);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *packet_endpoint, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    const packet::timestamp_t rtp_base = 1000000;
+
+    packet_writer.set_timestamp(rtp_base);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                packet_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            const core::nanoseconds_t capture_ts_base = -1;
+
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec,
+                                      capture_ts_base);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
+    }
+}
+
+TEST(receiver_source, timestamp_mapping_one_control_packet) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* packet_endpoint =
+        create_endpoint(slot, address::Iface_AudioSource, address::Proto_RTP);
+    CHECK(packet_endpoint);
+
+    packet::IWriter* control_endpoint =
+        create_endpoint(slot, address::Iface_AudioControl, address::Proto_RTCP);
+    CHECK(control_endpoint);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *packet_endpoint, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    test::ControlWriter control_writer(*control_endpoint, packet_factory,
+                                       byte_buffer_factory, src1, dst2);
+
+    const core::nanoseconds_t unix_base = 1000000000000000;
+    const packet::timestamp_t rtp_base = 1000000;
+
+    packet_writer.set_timestamp(rtp_base);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                packet_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            core::nanoseconds_t capture_ts_base = -1;
+            if (np != 0) {
+                capture_ts_base = unix_base;
+            }
+
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec,
+                                      capture_ts_base);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
+
+        if (np == 0) {
+            control_writer.write_sender_report(packet::unix_2_ntp(unix_base), rtp_base);
+        }
+    }
+}
+
+TEST(receiver_source, timestamp_mapping_periodic_control_packets) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* packet_endpoint =
+        create_endpoint(slot, address::Iface_AudioSource, address::Proto_RTP);
+    CHECK(packet_endpoint);
+
+    packet::IWriter* control_endpoint =
+        create_endpoint(slot, address::Iface_AudioControl, address::Proto_RTCP);
+    CHECK(control_endpoint);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *packet_endpoint, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    test::ControlWriter control_writer(*control_endpoint, packet_factory,
+                                       byte_buffer_factory, src1, dst2);
+
+    const core::nanoseconds_t unix_base_step = 1000000000000000;
+    const packet::timestamp_t rtp_base = 1000000;
+
+    packet_writer.set_timestamp(rtp_base);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                packet_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        const core::nanoseconds_t unix_base = unix_base_step * ((int)np + 1);
+
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            core::nanoseconds_t capture_ts_base = -1;
+            if (np != 0) {
+                capture_ts_base = unix_base - unix_base_step;
+            }
+
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_samples(SamplesPerFrame, 1, output_sample_spec,
+                                      capture_ts_base);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
+
+        control_writer.write_sender_report(packet::unix_2_ntp(unix_base), rtp_base);
+    }
+}
+
+IGNORE_TEST(receiver_source, timestamp_mapping_remixing) {
+    enum {
+        OutputRate = 48000,
+        PacketRate = 44100,
+        OutputChans = Chans_Stereo,
+        PacketChans = Chans_Mono
+    };
+
+    init(OutputRate, OutputChans, PacketRate, PacketChans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* packet_endpoint =
+        create_endpoint(slot, address::Iface_AudioSource, address::Proto_RTP);
+    CHECK(packet_endpoint);
+
+    packet::IWriter* control_endpoint =
+        create_endpoint(slot, address::Iface_AudioControl, address::Proto_RTCP);
+    CHECK(control_endpoint);
+
+    test::PacketWriter packet_writer(arena, *packet_endpoint, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    test::ControlWriter control_writer(*control_endpoint, packet_factory,
+                                       byte_buffer_factory, src1, dst2);
+
+    const core::nanoseconds_t unix_base = 1000000000000000;
+    const packet::timestamp_t rtp_base = 1000000;
+
+    packet_writer.set_timestamp(rtp_base);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                packet_sample_spec);
+
+    const size_t frame_size = SamplesPerFrame * OutputRate / PacketRate
+        / output_sample_spec.num_channels() * output_sample_spec.num_channels();
+    audio::sample_t frame_data[MaxBufSize];
+    size_t frame_num = 0;
+    core::nanoseconds_t first_ts = 0;
+
+    core::nanoseconds_t cur_time = 2000000000000000;
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(cur_time);
+            cur_time += output_sample_spec.samples_overall_2_ns(frame_size);
+
+            audio::Frame frame(frame_data, frame_size);
+            CHECK(receiver.read(frame));
+
+            if (!first_ts && frame.capture_timestamp()) {
+                first_ts = frame.capture_timestamp();
+
+                CHECK(first_ts >= unix_base);
+                CHECK(first_ts < unix_base + core::Millisecond * 10);
+            }
+
+            if (first_ts) {
+                const core::nanoseconds_t expected_capture_ts = first_ts
+                    + output_sample_spec.samples_overall_2_ns(frame_num * frame_size);
+
+                test::expect_capture_timestamp(expected_capture_ts,
+                                               frame.capture_timestamp(),
+                                               test::TimestampEpsilon);
+
+                frame_num++;
+            }
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, packet_sample_spec);
+
+        if (np == 0) {
+            control_writer.write_sender_report(packet::unix_2_ntp(unix_base), rtp_base);
+        }
+    }
+
+    CHECK(first_ts);
+}
+
+TEST(receiver_source, metrics_sessions) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo, MaxSess = 10 };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    {
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = MaxSess;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(0, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(0, sess_metrics_size);
+    }
+
+    packet::IWriter* endpoint1_writer =
+        create_endpoint(slot, address::Iface_AudioSource, proto1);
+    CHECK(endpoint1_writer);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer1(arena, *endpoint1_writer, rtp_composer, format_map,
+                                      packet_factory, byte_buffer_factory,
+                                      PayloadType_Ch2, src1, dst1);
+
+    packet_writer1.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                 output_sample_spec);
+
+    {
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = MaxSess;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(0, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(0, sess_metrics_size);
+    }
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_nonzero_samples(SamplesPerFrame, output_sample_spec);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer1.write_packets(1, SamplesPerPacket, output_sample_spec);
+
+        {
+            ReceiverSlotMetrics slot_metrics;
+            ReceiverSessionMetrics sess_metrics[MaxSess];
+            size_t sess_metrics_size = MaxSess;
+
+            slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+            UNSIGNED_LONGS_EQUAL(1, slot_metrics.num_sessions);
+            UNSIGNED_LONGS_EQUAL(1, sess_metrics_size);
+
+            CHECK(sess_metrics[0].latency.niq_latency != 0);
+            CHECK(sess_metrics[0].latency.e2e_latency == 0);
+        }
+    }
+
+    test::PacketWriter packet_writer2(arena, *endpoint1_writer, rtp_composer, format_map,
+                                      packet_factory, byte_buffer_factory,
+                                      PayloadType_Ch2, src2, dst1);
+
+    packet_writer2.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                 output_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_nonzero_samples(SamplesPerFrame, output_sample_spec);
+
+            UNSIGNED_LONGS_EQUAL(2, receiver.num_sessions());
+        }
+
+        packet_writer1.write_packets(1, SamplesPerPacket, output_sample_spec);
+        packet_writer2.write_packets(1, SamplesPerPacket, output_sample_spec);
+
+        {
+            ReceiverSlotMetrics slot_metrics;
+            ReceiverSessionMetrics sess_metrics[MaxSess];
+            size_t sess_metrics_size = MaxSess;
+
+            slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+            UNSIGNED_LONGS_EQUAL(2, slot_metrics.num_sessions);
+            UNSIGNED_LONGS_EQUAL(2, sess_metrics_size);
+
+            CHECK(sess_metrics[0].latency.niq_latency != 0);
+            CHECK(sess_metrics[0].latency.e2e_latency == 0);
+
+            CHECK(sess_metrics[1].latency.niq_latency != 0);
+            CHECK(sess_metrics[1].latency.e2e_latency == 0);
+        }
+    }
+}
+
+TEST(receiver_source, metrics_niq) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo, MaxSess = 10 };
+
+    init(Rate, Chans, Rate, Chans);
+
+    const core::nanoseconds_t virtual_niq_latency =
+        output_sample_spec.samples_per_chan_2_ns(Latency);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* endpoint1_writer =
+        create_endpoint(slot, address::Iface_AudioSource, proto1);
+    CHECK(endpoint1_writer);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *endpoint1_writer, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                output_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_nonzero_samples(SamplesPerFrame, output_sample_spec);
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, output_sample_spec);
+
+        {
+            ReceiverSlotMetrics slot_metrics;
+            ReceiverSessionMetrics sess_metrics[MaxSess];
+            size_t sess_metrics_size = MaxSess;
+
+            slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+            UNSIGNED_LONGS_EQUAL(1, slot_metrics.num_sessions);
+            UNSIGNED_LONGS_EQUAL(1, sess_metrics_size);
+
+            DOUBLES_EQUAL(virtual_niq_latency, sess_metrics[0].latency.niq_latency,
+                          core::Millisecond * 5);
+        }
+    }
+}
+
+TEST(receiver_source, metrics_e2e) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo, MaxSess = 10 };
+
+    init(Rate, Chans, Rate, Chans);
+
+    const core::nanoseconds_t virtual_e2e_latency = core::Millisecond * 555;
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* packet_endpoint =
+        create_endpoint(slot, address::Iface_AudioSource, proto1);
+    CHECK(packet_endpoint);
+
+    packet::IWriter* control_endpoint =
+        create_endpoint(slot, address::Iface_AudioControl, address::Proto_RTCP);
+    CHECK(control_endpoint);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer(arena, *packet_endpoint, rtp_composer, format_map,
+                                     packet_factory, byte_buffer_factory, PayloadType_Ch2,
+                                     src1, dst1);
+
+    test::ControlWriter control_writer(*control_endpoint, packet_factory,
+                                       byte_buffer_factory, src1, dst2);
+
+    const core::nanoseconds_t unix_base = 1000000000000000;
+    const packet::timestamp_t rtp_base = 1000000;
+
+    packet_writer.set_timestamp(rtp_base);
+
+    packet_writer.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                output_sample_spec);
+
+    for (size_t np = 0; np < ManyPackets; np++) {
+        for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+            core::nanoseconds_t capture_ts_base = -1;
+            if (np != 0) {
+                capture_ts_base = unix_base;
+            }
+
+            receiver.refresh(frame_reader.refresh_ts());
+            frame_reader.read_nonzero_samples(SamplesPerFrame, output_sample_spec,
+                                              capture_ts_base);
+
+            if (np != 0) {
+                receiver.reclock(frame_reader.last_capture_ts() + virtual_e2e_latency);
+            }
+
+            UNSIGNED_LONGS_EQUAL(1, receiver.num_sessions());
+        }
+
+        packet_writer.write_packets(1, SamplesPerPacket, output_sample_spec);
+
+        {
+            ReceiverSlotMetrics slot_metrics;
+            ReceiverSessionMetrics sess_metrics[MaxSess];
+            size_t sess_metrics_size = MaxSess;
+
+            slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+            UNSIGNED_LONGS_EQUAL(1, slot_metrics.num_sessions);
+            UNSIGNED_LONGS_EQUAL(1, sess_metrics_size);
+
+            if (np != 0) {
+                DOUBLES_EQUAL(virtual_e2e_latency, sess_metrics[0].latency.e2e_latency,
+                              core::Millisecond);
+            }
+        }
+
+        if (np == 0) {
+            control_writer.write_sender_report(packet::unix_2_ntp(unix_base), rtp_base);
+        }
+    }
+}
+
+TEST(receiver_source, metrics_truncation) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo, MaxSess = 10 };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
+    CHECK(receiver.is_valid());
+
+    ReceiverSlot* slot = create_slot(receiver);
+    CHECK(slot);
+
+    packet::IWriter* endpoint1_writer =
+        create_endpoint(slot, address::Iface_AudioSource, proto1);
+    CHECK(endpoint1_writer);
+
+    test::FrameReader frame_reader(receiver, sample_buffer_factory);
+
+    test::PacketWriter packet_writer1(arena, *endpoint1_writer, rtp_composer, format_map,
+                                      packet_factory, byte_buffer_factory,
+                                      PayloadType_Ch2, src1, dst1);
+
+    test::PacketWriter packet_writer2(arena, *endpoint1_writer, rtp_composer, format_map,
+                                      packet_factory, byte_buffer_factory,
+                                      PayloadType_Ch2, src2, dst1);
+
+    packet_writer1.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                 output_sample_spec);
+
+    packet_writer2.write_packets(Latency / SamplesPerPacket, SamplesPerPacket,
+                                 output_sample_spec);
+
+    for (size_t nf = 0; nf < FramesPerPacket; nf++) {
+        receiver.refresh(frame_reader.refresh_ts());
+        frame_reader.read_nonzero_samples(SamplesPerFrame, output_sample_spec);
+    }
+
+    UNSIGNED_LONGS_EQUAL(2, receiver.num_sessions());
+
+    { // metrics_size=0 num_sessions=2
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = 0;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(2, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(0, sess_metrics_size);
+    }
+
+    { // metrics_size=1 num_sessions=2
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = 1;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(2, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(1, sess_metrics_size);
+
+        CHECK(sess_metrics[0].latency.niq_latency > 0);
+        CHECK(sess_metrics[1].latency.niq_latency == 0);
+    }
+
+    { // metrics_size=2 num_sessions=2
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = 2;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(2, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(2, sess_metrics_size);
+
+        CHECK(sess_metrics[0].latency.niq_latency > 0);
+        CHECK(sess_metrics[1].latency.niq_latency > 0);
+        CHECK(sess_metrics[2].latency.niq_latency == 0);
+    }
+
+    { // metrics_size=3 num_sessions=2
+        ReceiverSlotMetrics slot_metrics;
+        ReceiverSessionMetrics sess_metrics[MaxSess];
+        size_t sess_metrics_size = 3;
+
+        slot->get_metrics(slot_metrics, sess_metrics, &sess_metrics_size);
+
+        UNSIGNED_LONGS_EQUAL(2, slot_metrics.num_sessions);
+        UNSIGNED_LONGS_EQUAL(2, sess_metrics_size);
+
+        CHECK(sess_metrics[0].latency.niq_latency > 0);
+        CHECK(sess_metrics[1].latency.niq_latency > 0);
+        CHECK(sess_metrics[2].latency.niq_latency == 0);
+    }
+}
+
+TEST(receiver_source, state) {
+    enum { Rate = SampleRate, Chans = Chans_Stereo };
+
+    init(Rate, Chans, Rate, Chans);
+
+    ReceiverSource receiver(make_config(), format_map, packet_factory,
+                            byte_buffer_factory, sample_buffer_factory, arena);
     CHECK(receiver.is_valid());
 
     ReceiverSlot* slot = create_slot(receiver);
@@ -1475,9 +2141,14 @@ TEST(receiver_source, state) {
     CHECK(samples);
     samples.reslice(0, FramesPerPacket * output_sample_spec.num_channels());
 
+    core::nanoseconds_t cur_time = 1000000000000000;
+
     CHECK(receiver.state() == sndio::DeviceState_Idle);
 
     {
+        receiver.refresh(cur_time);
+        cur_time += output_sample_spec.samples_overall_2_ns(samples.size());
+
         audio::Frame frame(samples.data(), samples.size());
         receiver.read(frame);
     }
@@ -1488,11 +2159,17 @@ TEST(receiver_source, state) {
     CHECK(receiver.state() == sndio::DeviceState_Active);
 
     {
+        receiver.refresh(cur_time);
+        cur_time += output_sample_spec.samples_overall_2_ns(samples.size());
+
         audio::Frame frame(samples.data(), samples.size());
         receiver.read(frame);
     }
 
     for (;;) {
+        receiver.refresh(cur_time);
+        cur_time += output_sample_spec.samples_overall_2_ns(samples.size());
+
         audio::Frame frame(samples.data(), samples.size());
         receiver.read(frame);
 

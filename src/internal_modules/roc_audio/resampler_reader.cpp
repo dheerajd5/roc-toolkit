@@ -21,7 +21,8 @@ ResamplerReader::ResamplerReader(IFrameReader& reader,
     , in_sample_spec_(in_sample_spec)
     , out_sample_spec_(out_sample_spec)
     , scaling_(1.0f)
-    , valid_(false) {
+    , valid_(false)
+    , last_in_ts_(0) {
     if (in_sample_spec_.channel_set() != out_sample_spec_.channel_set()) {
         roc_panic("resampler reader: input and output channel sets should be same");
     }
@@ -54,6 +55,10 @@ bool ResamplerReader::set_scaling(float multiplier) {
 bool ResamplerReader::read(Frame& out) {
     roc_panic_if_not(is_valid());
 
+    if (out.num_samples() % out_sample_spec_.num_channels() != 0) {
+        roc_panic("resampler reader: unexpected frame size");
+    }
+
     size_t out_pos = 0;
 
     while (out_pos < out.num_samples()) {
@@ -70,6 +75,8 @@ bool ResamplerReader::read(Frame& out) {
         out_pos += num_popped;
     }
 
+    out.set_capture_timestamp(capture_ts_(out));
+
     return true;
 }
 
@@ -83,7 +90,33 @@ bool ResamplerReader::push_input_() {
     }
 
     resampler_.end_push_input();
+
+    const core::nanoseconds_t capt_ts = frame.capture_timestamp();
+    if (capt_ts) {
+        last_in_ts_ = capt_ts + in_sample_spec_.samples_overall_2_ns(frame.num_samples());
+    }
+
     return true;
+}
+
+core::nanoseconds_t ResamplerReader::capture_ts_(Frame& frame) {
+    if (last_in_ts_ == 0) {
+        // we didn't receive frame with non-zero cts yet
+        return 0;
+    }
+
+    const core::nanoseconds_t capt_ts = last_in_ts_
+        - in_sample_spec_.fract_samples_per_chan_2_ns(resampler_.n_left_to_process())
+        - core::nanoseconds_t(out_sample_spec_.samples_overall_2_ns(frame.num_samples())
+                              * scaling_);
+
+    if (capt_ts < 0) {
+        // frame cts was very close to zero (unix epoch), in this case we
+        // avoid producing negative cts
+        return 0;
+    }
+
+    return capt_ts;
 }
 
 } // namespace audio

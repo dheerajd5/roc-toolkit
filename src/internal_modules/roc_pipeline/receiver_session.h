@@ -38,10 +38,12 @@
 #include "roc_packet/router.h"
 #include "roc_packet/sorted_queue.h"
 #include "roc_pipeline/config.h"
+#include "roc_pipeline/metrics.h"
 #include "roc_rtcp/metrics.h"
 #include "roc_rtp/format_map.h"
 #include "roc_rtp/parser.h"
 #include "roc_rtp/populator.h"
+#include "roc_rtp/timestamp_injector.h"
 #include "roc_rtp/validator.h"
 
 namespace roc {
@@ -73,15 +75,24 @@ public:
     //!  true if the packet is dedicated for this session
     bool handle(const packet::PacketPtr& packet);
 
-    //! Advance session timestamp.
+    //! Refresh pipeline according to current time.
+    //! @remarks
+    //!  writes to @p next_refresh deadline (absolute time) when refresh should
+    //!  be invoked again if there are no frames
     //! @returns
     //!  false if the session is ended
-    bool advance(packet::timestamp_t timestamp);
+    bool refresh(core::nanoseconds_t current_time, core::nanoseconds_t* next_refresh);
 
     //! Adjust session clock to match consumer clock.
+    //! @remarks
+    //!  @p playback_time specified absolute time when first sample of last frame
+    //!  retrieved from pipeline will be actually played on sink
     //! @returns
     //!  false if the session is ended
-    bool reclock(packet::ntp_timestamp_t timestamp);
+    bool reclock(core::nanoseconds_t playback_time);
+
+    //! Get session metrics.
+    ReceiverSessionMetrics get_metrics() const;
 
     //! Get audio reader.
     audio::IFrameReader& reader();
@@ -113,6 +124,9 @@ private:
     core::ScopedPtr<fec::IBlockDecoder> fec_decoder_;
     core::Optional<fec::Reader> fec_reader_;
     core::Optional<rtp::Validator> fec_validator_;
+    core::Optional<rtp::Populator> fec_populator_;
+
+    core::Optional<rtp::TimestampInjector> timestamp_injector_;
 
     core::Optional<audio::Depacketizer> depacketizer_;
 

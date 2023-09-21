@@ -93,6 +93,9 @@ bool sender_config_from_user(node::Context& context,
         out.packet_length = (core::nanoseconds_t)in.packet_length;
     }
 
+    out.enable_timing = false;
+    out.enable_auto_cts = true;
+
     out.enable_interleaving = in.packet_interleaving;
 
     if (!fec_encoding_from_user(out.fec_encoder.scheme, in.fec_encoding)) {
@@ -169,6 +172,9 @@ bool receiver_config_from_user(node::Context&,
         out.default_session.watchdog.deduce_choppy_playback_window(
             out.default_session.watchdog.choppy_playback_timeout);
     }
+
+    out.common.enable_timing = false;
+    out.common.enable_auto_reclock = true;
 
     if (!sample_spec_from_user(out.common.output_sample_spec, in.frame_encoding)) {
         roc_log(LogError,
@@ -592,6 +598,40 @@ bool proto_to_user(roc_protocol& out, address::Protocol in) {
     }
 
     return false;
+}
+
+ROC_ATTR_NO_SANITIZE_UB
+void receiver_slot_metrics_to_user(roc_receiver_metrics& out,
+                                   const pipeline::ReceiverSlotMetrics& in) {
+    out.num_sessions = (unsigned)in.num_sessions;
+}
+
+ROC_ATTR_NO_SANITIZE_UB
+void receiver_session_metrics_to_user(
+    const pipeline::ReceiverSessionMetrics& sess_metrics,
+    size_t sess_index,
+    void* sess_arg) {
+    roc_session_metrics& out = *((roc_session_metrics*)sess_arg + sess_index);
+
+    memset(&out, 0, sizeof(out));
+
+    if (sess_metrics.latency.niq_latency > 0) {
+        out.niq_latency = (unsigned long long)sess_metrics.latency.niq_latency;
+    }
+
+    if (sess_metrics.latency.e2e_latency > 0) {
+        out.e2e_latency = (unsigned long long)sess_metrics.latency.e2e_latency;
+    }
+}
+
+ROC_ATTR_NO_SANITIZE_UB
+void sender_metrics_to_user(roc_sender_metrics& out,
+                            const pipeline::SenderSlotMetrics& in_slot,
+                            const pipeline::SenderSessionMetrics& in_sess) {
+    memset(&out, 0, sizeof(out));
+
+    (void)in_slot;
+    (void)in_sess;
 }
 
 ROC_ATTR_NO_SANITIZE_UB

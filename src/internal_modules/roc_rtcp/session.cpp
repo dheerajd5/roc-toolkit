@@ -10,6 +10,7 @@
 #include "roc_core/fast_random.h"
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
+#include "roc_core/time.h"
 #include "roc_packet/ntp.h"
 
 namespace roc {
@@ -61,26 +62,33 @@ void Session::process_packet(const packet::PacketPtr& packet) {
     parse_reports_(traverser);
 }
 
-core::nanoseconds_t Session::generation_deadline() {
+core::nanoseconds_t Session::generation_deadline(core::nanoseconds_t current_time) {
     if (next_deadline_ == 0) {
-        next_deadline_ = core::timestamp(core::ClockMonotonic);
+        // until generate_packets() is called first time, report that
+        // we're ready immediately
+        next_deadline_ = current_time;
     }
 
     return next_deadline_;
 }
 
-void Session::generate_packets() {
+void Session::generate_packets(core::nanoseconds_t current_time) {
     roc_panic_if_msg(!packet_writer_, "rtcp session: packet writer not set");
 
     if (next_deadline_ == 0) {
-        next_deadline_ = core::timestamp(core::ClockMonotonic);
+        next_deadline_ = current_time;
+    }
+
+    if (next_deadline_ > current_time) {
+        return;
     }
 
     do {
+        // TODO: use IntervalComputer
         next_deadline_ += core::Millisecond * 200;
-    } while (next_deadline_ <= core::timestamp(core::ClockMonotonic));
+    } while (next_deadline_ <= current_time);
 
-    packet::PacketPtr packet = generate_packet_();
+    packet::PacketPtr packet = generate_packet_(current_time);
 
     if (packet) {
         packet_writer_->write(packet);
@@ -186,7 +194,7 @@ void Session::parse_goodbye_(const ByeTraverser& bye) {
 
 void Session::parse_sender_report_(const header::SenderReportPacket& sr) {
     SendingMetrics metrics;
-    metrics.origin_ntp = sr.ntp_timestamp();
+    metrics.origin_time = packet::ntp_2_unix(sr.ntp_timestamp());
     metrics.origin_rtp = sr.rtp_timestamp();
 
     if (recv_hooks_) {
@@ -214,7 +222,7 @@ void Session::parse_reception_block_(const header::ReceptionReportBlock& blk) {
     }
 }
 
-packet::PacketPtr Session::generate_packet_() {
+packet::PacketPtr Session::generate_packet_(core::nanoseconds_t current_time) {
     packet::PacketPtr packet = packet_factory_.new_packet();
     if (!packet) {
         roc_log(LogError, "rtcp session: can't create packet");
@@ -232,7 +240,7 @@ packet::PacketPtr Session::generate_packet_() {
     rtcp_data.reslice(0, 0);
 
     // fill RTCP packet
-    if (!build_packet_(rtcp_data)) {
+    if (!build_packet_(rtcp_data, current_time)) {
         roc_log(LogError, "rtcp session: can't build packet");
         return NULL;
     }
@@ -273,10 +281,7 @@ packet::PacketPtr Session::generate_packet_() {
     return packet;
 }
 
-bool Session::build_packet_(core::Slice<uint8_t>& data) {
-    // FIXME
-    const packet::ntp_timestamp_t report_time = packet::ntp_timestamp();
-
+bool Session::build_packet_(core::Slice<uint8_t>& data, core::nanoseconds_t report_time) {
     Builder bld(data);
 
     if (send_hooks_) {
@@ -292,14 +297,14 @@ bool Session::build_packet_(core::Slice<uint8_t>& data) {
     return true;
 }
 
-void Session::build_sender_report_(Builder& bld, packet::ntp_timestamp_t report_time) {
+void Session::build_sender_report_(Builder& bld, core::nanoseconds_t report_time) {
     roc_panic_if(!send_hooks_);
 
     const SendingMetrics metrics = send_hooks_->on_get_sending_metrics(report_time);
 
     header::SenderReportPacket sr;
     sr.set_ssrc(ssrc_);
-    sr.set_ntp_timestamp(metrics.origin_ntp);
+    sr.set_ntp_timestamp(packet::unix_2_ntp(metrics.origin_time));
     sr.set_rtp_timestamp(metrics.origin_rtp);
 
     bld.begin_sr(sr);
@@ -316,7 +321,7 @@ void Session::build_sender_report_(Builder& bld, packet::ntp_timestamp_t report_
     bld.end_sr();
 }
 
-void Session::build_receiver_report_(Builder& bld, packet::ntp_timestamp_t report_time) {
+void Session::build_receiver_report_(Builder& bld, core::nanoseconds_t report_time) {
     header::ReceiverReportPacket rr;
     rr.set_ssrc(ssrc_);
 
@@ -340,7 +345,7 @@ void Session::build_receiver_report_(Builder& bld, packet::ntp_timestamp_t repor
 
     {
         header::XrRrtrBlock rrtr;
-        rrtr.set_ntp_timestamp(report_time);
+        rrtr.set_ntp_timestamp(packet::unix_2_ntp(report_time));
 
         bld.add_xr_rrtr(rrtr);
     }

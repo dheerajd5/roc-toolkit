@@ -9,6 +9,7 @@
 #include "roc_pipeline/receiver_session_group.h"
 #include "roc_address/socket_addr_to_str.h"
 #include "roc_core/log.h"
+#include "roc_core/panic.h"
 
 namespace roc {
 namespace pipeline {
@@ -45,26 +46,42 @@ void ReceiverSessionGroup::route_packet(const packet::PacketPtr& packet) {
     route_transport_packet_(packet);
 }
 
-void ReceiverSessionGroup::advance_sessions(packet::timestamp_t timestamp) {
+core::nanoseconds_t
+ReceiverSessionGroup::refresh_sessions(core::nanoseconds_t current_time) {
     core::SharedPtr<ReceiverSession> curr, next;
+
+    core::nanoseconds_t next_deadline = 0;
 
     for (curr = sessions_.front(); curr; curr = next) {
         next = sessions_.nextof(*curr);
 
-        if (!curr->advance(timestamp)) {
+        core::nanoseconds_t sess_deadline = 0;
+
+        if (!curr->refresh(current_time, &sess_deadline)) {
             // Session ended.
             remove_session_(*curr);
+            continue;
+        }
+
+        if (sess_deadline != 0) {
+            if (next_deadline == 0) {
+                next_deadline = sess_deadline;
+            } else {
+                next_deadline = std::min(next_deadline, sess_deadline);
+            }
         }
     }
+
+    return next_deadline;
 }
 
-void ReceiverSessionGroup::reclock_sessions(packet::ntp_timestamp_t timestamp) {
+void ReceiverSessionGroup::reclock_sessions(core::nanoseconds_t playback_time) {
     core::SharedPtr<ReceiverSession> curr, next;
 
     for (curr = sessions_.front(); curr; curr = next) {
         next = sessions_.nextof(*curr);
 
-        if (!curr->reclock(timestamp)) {
+        if (!curr->reclock(playback_time)) {
             // Session ended.
             remove_session_(*curr);
         }
@@ -73,6 +90,25 @@ void ReceiverSessionGroup::reclock_sessions(packet::ntp_timestamp_t timestamp) {
 
 size_t ReceiverSessionGroup::num_sessions() const {
     return sessions_.size();
+}
+
+void ReceiverSessionGroup::get_metrics(ReceiverSessionMetrics* metrics,
+                                       size_t* metrics_size) const {
+    roc_panic_if_not(metrics);
+    roc_panic_if_not(metrics_size);
+
+    *metrics_size = std::min(*metrics_size, sessions_.size());
+
+    size_t n = 0;
+
+    for (core::SharedPtr<ReceiverSession> sess = sessions_.front(); sess;
+         sess = sessions_.nextof(*sess)) {
+        if (n == *metrics_size) {
+            break;
+        }
+        metrics[n] = sess->get_metrics();
+        n++;
+    }
 }
 
 void ReceiverSessionGroup::on_update_source(packet::source_t ssrc, const char* cname) {
@@ -101,6 +137,7 @@ ReceiverSessionGroup::on_get_reception_metrics(size_t source_index) {
 void ReceiverSessionGroup::on_add_sending_metrics(const rtcp::SendingMetrics& metrics) {
     core::SharedPtr<ReceiverSession> sess;
 
+    // TODO: match session by SSRC/CNAME
     for (sess = sessions_.front(); sess; sess = sessions_.nextof(*sess)) {
         sess->add_sending_metrics(metrics);
     }
@@ -109,6 +146,7 @@ void ReceiverSessionGroup::on_add_sending_metrics(const rtcp::SendingMetrics& me
 void ReceiverSessionGroup::on_add_link_metrics(const rtcp::LinkMetrics& metrics) {
     core::SharedPtr<ReceiverSession> sess;
 
+    // TODO: match session by SSRC/CNAME
     for (sess = sessions_.front(); sess; sess = sessions_.nextof(*sess)) {
         sess->add_link_metrics(metrics);
     }

@@ -63,11 +63,15 @@ public:
     //! Delete slot.
     void delete_slot(SenderSlot* slot);
 
-    //! Get deadline when the pipeline should be updated.
-    core::nanoseconds_t get_update_deadline();
-
-    //! Update pipeline.
-    void update();
+    //! Refresh pipeline according to current time.
+    //! @remarks
+    //!  Should be invoked after writing each frame.
+    //!  Also should be invoked after provided deadline if no frames were
+    //!  written until that deadline expires.
+    //! @returns
+    //!  deadline (absolute time) when refresh should be invoked again
+    //!  if there are no frames
+    core::nanoseconds_t refresh(core::nanoseconds_t current_time);
 
     //! Get device type.
     virtual sndio::DeviceType type() const;
@@ -90,6 +94,9 @@ public:
     //! Get latency of the sink.
     virtual core::nanoseconds_t latency() const;
 
+    //! Check if the sink supports latency reports.
+    virtual bool has_latency() const;
+
     //! Check if the sink has own clock.
     virtual bool has_clock() const;
 
@@ -97,9 +104,6 @@ public:
     virtual void write(audio::Frame& frame);
 
 private:
-    void compute_update_deadline_();
-    void invalidate_update_deadline_();
-
     const SenderConfig config_;
 
     const rtp::FormatMap& format_map_;
@@ -117,9 +121,6 @@ private:
     core::Optional<audio::ProfilingWriter> profiler_;
 
     audio::IFrameWriter* audio_writer_;
-
-    bool update_deadline_valid_;
-    core::nanoseconds_t update_deadline_;
 };
 
 } // namespace pipeline

@@ -14,6 +14,7 @@
 
 #include "roc_core/slice.h"
 #include "roc_core/stddefs.h"
+#include "roc_core/time.h"
 #include "roc_packet/units.h"
 
 namespace roc {
@@ -44,6 +45,16 @@ struct RTP {
     //! @remarks
     //!  Duration is measured in the same units as timestamp.
     timestamp_t duration;
+
+    //! Timestamp of the first sample at the moment it was captured from an interface.
+    //! @remarks
+    //!  In an ideal case the meaning of this value should be the same on a sender
+    //!  and a receiver, particularly it should store the moment in time the first sample
+    //!  of a packet came into existence. In practice receiver estimates this value for
+    //!  each packet with the help of RTCP and XR. If RTCP is not available, timestamps
+    //!  will be zero, If RTCP is available, but without XR, timestamps will be correct
+    //!  only of NTP system clocks on sender and receiver are synchronized.
+    core::nanoseconds_t capture_timestamp;
 
     //! Packet marker bit.
     //! @remarks

@@ -130,6 +130,32 @@ int roc_sender_connect(roc_sender* sender,
     return 0;
 }
 
+int roc_sender_query(roc_sender* sender, roc_slot slot, roc_sender_metrics* metrics) {
+    if (!sender) {
+        roc_log(LogError, "roc_sender_query(): invalid arguments: sender is null");
+        return -1;
+    }
+
+    if (!metrics) {
+        roc_log(LogError, "roc_sender_query(): invalid arguments: metrics are null");
+        return -1;
+    }
+
+    node::Sender* imp_sender = (node::Sender*)sender;
+
+    pipeline::SenderSlotMetrics slot_metrics;
+    pipeline::SenderSessionMetrics sess_metrics;
+
+    if (!imp_sender->get_metrics(slot, slot_metrics, sess_metrics)) {
+        roc_log(LogError, "roc_sender_query(): operation failed");
+        return -1;
+    }
+
+    api::sender_metrics_to_user(*metrics, slot_metrics, sess_metrics);
+
+    return 0;
+}
+
 int roc_sender_unlink(roc_sender* sender, roc_slot slot) {
     if (!sender) {
         roc_log(LogError, "roc_sender_unlink(): invalid arguments: sender is null");
@@ -169,8 +195,8 @@ int roc_sender_write(roc_sender* sender, const roc_frame* frame) {
 
     if (frame->samples_size % factor != 0) {
         roc_log(LogError,
-                "roc_sender_write(): invalid arguments: # of samples should be "
-                "multiple of # of %u",
+                "roc_sender_write(): invalid arguments:"
+                " # of samples should be multiple of %u",
                 (unsigned)factor);
         return -1;
     }
@@ -181,7 +207,6 @@ int roc_sender_write(roc_sender* sender, const roc_frame* frame) {
     }
 
     audio::Frame imp_frame((float*)frame->samples, frame->samples_size / sizeof(float));
-
     imp_sink.write(imp_frame);
 
     return 0;

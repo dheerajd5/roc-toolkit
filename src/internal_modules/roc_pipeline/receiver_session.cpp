@@ -10,6 +10,7 @@
 #include "roc_audio/resampler_map.h"
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
+#include "roc_core/time.h"
 #include "roc_fec/codec_map.h"
 
 namespace roc {
@@ -112,7 +113,21 @@ ReceiverSession::ReceiverSession(
             return;
         }
         preader = fec_validator_.get();
+
+        fec_populator_.reset(new (fec_populator_) rtp::Populator(
+            *preader, *payload_decoder_, format->sample_spec));
+        if (!fec_populator_) {
+            return;
+        }
+        preader = fec_populator_.get();
     }
+
+    timestamp_injector_.reset(new (timestamp_injector_)
+                                  rtp::TimestampInjector(*preader, format->sample_spec));
+    if (!timestamp_injector_) {
+        return;
+    }
+    preader = timestamp_injector_.get();
 
     depacketizer_.reset(new (depacketizer_) audio::Depacketizer(
         *preader, *payload_decoder_, format->sample_spec, common_config.enable_beeping));
@@ -188,12 +203,13 @@ ReceiverSession::ReceiverSession(
     areader = session_poisoner_.get();
 
     latency_monitor_.reset(new (latency_monitor_) audio::LatencyMonitor(
-        *source_queue_, *depacketizer_, resampler_reader_.get(),
+        *areader, *source_queue_, *depacketizer_, resampler_reader_.get(),
         session_config.latency_monitor, session_config.target_latency,
         format->sample_spec, common_config.output_sample_spec));
     if (!latency_monitor_ || !latency_monitor_->is_valid()) {
         return;
     }
+    areader = latency_monitor_.get();
 
     audio_reader_ = areader;
 }
@@ -218,29 +234,42 @@ bool ReceiverSession::handle(const packet::PacketPtr& packet) {
     return true;
 }
 
-bool ReceiverSession::advance(packet::timestamp_t timestamp) {
+bool ReceiverSession::refresh(core::nanoseconds_t current_time,
+                              core::nanoseconds_t* next_refresh) {
     roc_panic_if(!is_valid());
 
+    (void)current_time;
+
+    if (next_refresh) {
+        *next_refresh = 0;
+    }
+
     if (watchdog_) {
-        if (!watchdog_->update()) {
+        if (!watchdog_->is_alive()) {
             return false;
         }
     }
 
-    if (latency_monitor_) {
-        if (!latency_monitor_->update(timestamp)) {
-            return false;
-        }
+    if (!latency_monitor_->is_alive()) {
+        return false;
     }
 
     return true;
 }
 
-bool ReceiverSession::reclock(packet::ntp_timestamp_t) {
+bool ReceiverSession::reclock(core::nanoseconds_t playback_time) {
     roc_panic_if(!is_valid());
 
-    // no-op
-    return true;
+    return latency_monitor_->reclock(playback_time);
+}
+
+ReceiverSessionMetrics ReceiverSession::get_metrics() const {
+    roc_panic_if(!is_valid());
+
+    ReceiverSessionMetrics metrics;
+    metrics.latency = latency_monitor_->metrics();
+
+    return metrics;
 }
 
 audio::IFrameReader& ReceiverSession::reader() {
@@ -250,8 +279,9 @@ audio::IFrameReader& ReceiverSession::reader() {
 }
 
 void ReceiverSession::add_sending_metrics(const rtcp::SendingMetrics& metrics) {
-    // TODO
-    (void)metrics;
+    roc_panic_if(!is_valid());
+
+    timestamp_injector_->update_mapping(metrics.origin_time, metrics.origin_rtp);
 }
 
 void ReceiverSession::add_link_metrics(const rtcp::LinkMetrics& metrics) {

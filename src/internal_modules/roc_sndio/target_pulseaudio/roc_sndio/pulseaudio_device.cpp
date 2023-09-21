@@ -9,6 +9,7 @@
 #include "roc_sndio/pulseaudio_device.h"
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
+#include "roc_packet/units.h"
 
 namespace roc {
 namespace sndio {
@@ -17,6 +18,9 @@ namespace {
 
 const core::nanoseconds_t ReportInterval = 10 * core::Second;
 
+// 60ms is known to work well with majority of sound cards and pulseaudio
+// however, on many sound cards you may use lower latencies, e.g.
+// 40ms or 20ms, and sometimes even 10ms
 const core::nanoseconds_t DefaultLatency = core::Millisecond * 60;
 
 const core::nanoseconds_t MinTimeout = core::Millisecond * 50;
@@ -32,6 +36,8 @@ PulseaudioDevice::PulseaudioDevice(const Config& config, DeviceType device_type)
     , record_frag_data_(NULL)
     , record_frag_size_(0)
     , record_frag_flag_(false)
+    , target_latency_(0)
+    , timeout_(0)
     , open_done_(false)
     , opened_(false)
     , mainloop_(NULL)
@@ -42,11 +48,11 @@ PulseaudioDevice::PulseaudioDevice(const Config& config, DeviceType device_type)
     , timer_deadline_(0)
     , rate_limiter_(ReportInterval) {
     if (config.latency != 0) {
-        latency_ = config.latency;
+        target_latency_ = config.latency;
     } else {
-        latency_ = DefaultLatency;
+        target_latency_ = DefaultLatency;
     }
-    timeout_ = latency_ * 2;
+    timeout_ = target_latency_ * 2;
     if (timeout_ < MinTimeout) {
         timeout_ = MinTimeout;
     }
@@ -142,15 +148,17 @@ core::nanoseconds_t PulseaudioDevice::latency() const {
 
     pa_threaded_mainloop_lock(mainloop_);
 
-    const core::nanoseconds_t latency = config_.latency;
+    core::nanoseconds_t latency = 0;
+
+    if (!get_latency_(latency)) {
+        // until latency information is retrieved from server first time,
+        // assume that actual latency is equal to target latency
+        latency = target_latency_;
+    }
 
     pa_threaded_mainloop_unlock(mainloop_);
 
     return latency;
-}
-
-bool PulseaudioDevice::has_clock() const {
-    return true;
 }
 
 bool PulseaudioDevice::request(audio::Frame& frame) {
@@ -168,6 +176,15 @@ bool PulseaudioDevice::request(audio::Frame& frame) {
 
         const ssize_t ret = request_stream_(data, size);
 
+        if (ret > 0) {
+            data += (size_t)ret;
+            size -= (size_t)ret;
+        }
+
+        if (size == 0) {
+            report_latency_();
+        }
+
         pa_threaded_mainloop_unlock(mainloop_);
 
         if (ret < 0) {
@@ -183,9 +200,6 @@ bool PulseaudioDevice::request(audio::Frame& frame) {
 
             return false;
         }
-
-        data += (size_t)ret;
-        size -= (size_t)ret;
     }
 
     return true;
@@ -204,7 +218,7 @@ bool PulseaudioDevice::check_stream_params_() const {
         return false;
     }
 
-    if (latency_ <= 0) {
+    if (target_latency_ <= 0) {
         roc_log(LogError, "pulseaudio %s: latency should be positive",
                 device_type_to_str(device_type_));
         return false;
@@ -461,8 +475,8 @@ void PulseaudioDevice::init_stream_params_(const pa_sample_spec& device_sample_s
 
     const size_t frame_size_bytes = frame_size_ * sizeof(audio::sample_t);
 
-    const size_t latency_bytes =
-        config_.sample_spec.ns_2_samples_overall(latency_) * sizeof(audio::sample_t);
+    const size_t latency_bytes = config_.sample_spec.ns_2_samples_overall(target_latency_)
+        * sizeof(audio::sample_t);
 
     switch (device_type_) {
     case DeviceType_Sink:
@@ -500,11 +514,15 @@ bool PulseaudioDevice::open_stream_() {
         return false;
     }
 
-    const pa_stream_flags_t flags =
-        pa_stream_flags_t(PA_STREAM_ADJUST_LATENCY | PA_STREAM_AUTO_TIMING_UPDATE);
+    const pa_stream_flags_t flags = pa_stream_flags_t(
+        // adjust device latency based on requested stream latency
+        PA_STREAM_ADJUST_LATENCY
+        // periodically send updated latency from server to client
+        | PA_STREAM_AUTO_TIMING_UPDATE
+        // interpolate actual latency instead of going to server each time
+        | PA_STREAM_INTERPOLATE_TIMING);
 
     pa_stream_set_state_callback(stream_, stream_state_cb_, this);
-    pa_stream_set_latency_update_callback(stream_, stream_latency_cb_, this);
 
     switch (device_type_) {
     case DeviceType_Sink: {
@@ -663,8 +681,8 @@ ssize_t PulseaudioDevice::wait_stream_() {
                     "pulseaudio %s: stream timeout expired:"
                     " latency=%ld(%.3fms) timeout=%ld(%.3fms)",
                     device_type_to_str(device_type_),
-                    (long)config_.sample_spec.ns_2_rtp_timestamp(latency_),
-                    (double)latency_ / core::Millisecond,
+                    (long)config_.sample_spec.ns_2_rtp_timestamp(target_latency_),
+                    (double)target_latency_ / core::Millisecond,
                     (long)config_.sample_spec.ns_2_rtp_timestamp(timeout_),
                     (double)timeout_ / core::Millisecond);
 
@@ -677,8 +695,8 @@ ssize_t PulseaudioDevice::wait_stream_() {
                         "pulseaudio %s: stream timeout increased:"
                         " latency=%ld(%.3fms) timeout=%ld(%.3fms)",
                         device_type_to_str(device_type_),
-                        (long)config_.sample_spec.ns_2_rtp_timestamp(latency_),
-                        (double)latency_ / core::Millisecond,
+                        (long)config_.sample_spec.ns_2_rtp_timestamp(target_latency_),
+                        (double)target_latency_ / core::Millisecond,
                         (long)config_.sample_spec.ns_2_rtp_timestamp(timeout_),
                         (double)timeout_ / core::Millisecond);
             }
@@ -744,37 +762,42 @@ void PulseaudioDevice::stream_request_cb_(pa_stream*, size_t length, void* userd
     }
 }
 
-void PulseaudioDevice::stream_latency_cb_(pa_stream* stream, void* userdata) {
-    PulseaudioDevice& self = *(PulseaudioDevice*)userdata;
-
-    roc_log(LogTrace, "pulseaudio %s: stream latency callback",
-            device_type_to_str(self.device_type_));
-
-    if (!self.rate_limiter_.allow()) {
-        return;
-    }
-
+bool PulseaudioDevice::get_latency_(core::nanoseconds_t& result) const {
     pa_usec_t latency_us = 0;
     int negative = 0;
 
-    if (int err = pa_stream_get_latency(stream, &latency_us, &negative)) {
+    if (int err = pa_stream_get_latency(stream_, &latency_us, &negative)) {
         roc_log(LogError, "pulseaudio %s: pa_stream_get_latency(): %s",
-                device_type_to_str(self.device_type_), pa_strerror(err));
-        return;
+                device_type_to_str(device_type_), pa_strerror(err));
+        return false;
     }
 
     ssize_t latency =
-        (ssize_t)(pa_usec_to_bytes(latency_us, &self.sample_spec_)
-                  / sizeof(audio::sample_t) / self.config_.sample_spec.num_channels());
+        (ssize_t)(pa_usec_to_bytes(latency_us, &sample_spec_) / sizeof(audio::sample_t)
+                  / config_.sample_spec.num_channels());
 
     if (negative) {
         latency = -latency;
     }
 
-    roc_log(LogDebug, "pulseaudio %s: stream_latency=%ld(%.3fms)",
-            device_type_to_str(self.device_type_), (long)latency,
-            (double)self.config_.sample_spec.samples_per_chan_2_ns((size_t)latency)
-                / core::Millisecond);
+    result = config_.sample_spec.fract_samples_per_chan_2_ns((float)latency);
+    return true;
+}
+
+void PulseaudioDevice::report_latency_() {
+    if (!rate_limiter_.allow()) {
+        return;
+    }
+
+    core::nanoseconds_t latency = 0;
+
+    if (!get_latency_(latency)) {
+        return;
+    }
+
+    roc_log(LogDebug, "pulseaudio %s: io_latency=%ld(%.3fms)",
+            device_type_to_str(device_type_), (long)latency,
+            (double)latency / core::Millisecond);
 }
 
 void PulseaudioDevice::start_timer_(core::nanoseconds_t timeout) {

@@ -27,8 +27,9 @@ Receiver::Receiver(Context& context, const pipeline::ReceiverConfig& pipeline_co
                 context.sample_buffer_factory(),
                 context.arena())
     , processing_task_(pipeline_)
-    , slot_pool_(context.arena())
+    , slot_pool_("slot_pool", context.arena())
     , slot_map_(context.arena())
+    , sess_metrics_(context.arena())
     , valid_(false) {
     roc_log(LogDebug, "receiver node: initializing");
 
@@ -60,7 +61,7 @@ bool Receiver::is_valid() {
     return valid_;
 }
 
-bool Receiver::configure(size_t slot_index,
+bool Receiver::configure(slot_index_t slot_index,
                          address::Interface iface,
                          const netio::UdpReceiverConfig& config) {
     core::Mutex::Lock lock(mutex_);
@@ -107,7 +108,7 @@ bool Receiver::configure(size_t slot_index,
     return true;
 }
 
-bool Receiver::bind(size_t slot_index,
+bool Receiver::bind(slot_index_t slot_index,
                     address::Interface iface,
                     address::EndpointUri& uri) {
     core::Mutex::Lock lock(mutex_);
@@ -214,7 +215,7 @@ bool Receiver::bind(size_t slot_index,
     return true;
 }
 
-bool Receiver::unlink(size_t slot_index) {
+bool Receiver::unlink(slot_index_t slot_index) {
     core::Mutex::Lock lock(mutex_);
 
     roc_panic_if_not(is_valid());
@@ -232,6 +233,52 @@ bool Receiver::unlink(size_t slot_index) {
 
     cleanup_slot_(*slot);
     slot_map_.remove(*slot);
+
+    return true;
+}
+
+bool Receiver::get_metrics(slot_index_t slot_index,
+                           pipeline::ReceiverSlotMetrics& slot_metrics,
+                           sess_metrics_func_t sess_metrics_func,
+                           size_t* sess_metrics_size,
+                           void* sess_metrics_arg) {
+    core::Mutex::Lock lock(mutex_);
+
+    roc_panic_if_not(is_valid());
+
+    roc_panic_if(!sess_metrics_func);
+    roc_panic_if(!sess_metrics_size);
+
+    core::SharedPtr<Slot> slot = get_slot_(slot_index, false);
+    if (!slot) {
+        roc_log(LogError,
+                "receiver node:"
+                " can't get metrics of slot %lu: can't find slot",
+                (unsigned long)slot_index);
+        return false;
+    }
+
+    if (!sess_metrics_.resize(*sess_metrics_size)) {
+        roc_log(LogError,
+                "receiver node:"
+                " can't get metrics of slot %lu: can't allocate buffer",
+                (unsigned long)slot_index);
+        return false;
+    }
+
+    pipeline::ReceiverLoop::Tasks::QuerySlot task(
+        slot->handle, slot_metrics, sess_metrics_.data(), sess_metrics_size);
+    if (!pipeline_.schedule_and_wait(task)) {
+        roc_log(LogError,
+                "receiver node:"
+                " can't get metrics of slot %lu: operation failed",
+                (unsigned long)slot_index);
+        return false;
+    }
+
+    for (size_t sess_index = 0; sess_index < *sess_metrics_size; sess_index++) {
+        sess_metrics_func(sess_metrics_[sess_index], sess_index, sess_metrics_arg);
+    }
 
     return true;
 }
@@ -275,7 +322,8 @@ void Receiver::update_compatibility_(address::Interface iface,
     used_protocols_[iface] = uri.proto();
 }
 
-core::SharedPtr<Receiver::Slot> Receiver::get_slot_(size_t slot_index, bool auto_create) {
+core::SharedPtr<Receiver::Slot> Receiver::get_slot_(slot_index_t slot_index,
+                                                    bool auto_create) {
     core::SharedPtr<Slot> slot = slot_map_.find(slot_index);
 
     if (!slot) {

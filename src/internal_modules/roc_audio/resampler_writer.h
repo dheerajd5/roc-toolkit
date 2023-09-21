@@ -48,6 +48,7 @@ public:
 
 private:
     size_t push_input_(Frame& frame, size_t frame_pos);
+    core::nanoseconds_t capture_ts_(Frame& frame, size_t frame_pos);
 
     IResampler& resampler_;
     IFrameWriter& writer_;
@@ -61,6 +62,8 @@ private:
     core::Slice<sample_t> input_;
     core::Slice<sample_t> output_;
 
+    float scaling_;
+    float next_scaling_;
     bool valid_;
 };
 

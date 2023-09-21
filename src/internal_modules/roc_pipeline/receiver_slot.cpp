@@ -58,11 +58,7 @@ ReceiverEndpoint* ReceiverSlot::add_endpoint(address::Interface iface,
     return NULL;
 }
 
-void ReceiverSlot::advance(packet::timestamp_t timestamp) {
-    if (control_endpoint_) {
-        control_endpoint_->pull_packets();
-    }
-
+core::nanoseconds_t ReceiverSlot::refresh(core::nanoseconds_t current_time) {
     if (source_endpoint_) {
         source_endpoint_->pull_packets();
     }
@@ -71,15 +67,30 @@ void ReceiverSlot::advance(packet::timestamp_t timestamp) {
         repair_endpoint_->pull_packets();
     }
 
-    session_group_.advance_sessions(timestamp);
+    if (control_endpoint_) {
+        control_endpoint_->pull_packets();
+    }
+
+    return session_group_.refresh_sessions(current_time);
 }
 
-void ReceiverSlot::reclock(packet::ntp_timestamp_t timestamp) {
-    session_group_.reclock_sessions(timestamp);
+void ReceiverSlot::reclock(core::nanoseconds_t playback_time) {
+    session_group_.reclock_sessions(playback_time);
 }
 
 size_t ReceiverSlot::num_sessions() const {
     return session_group_.num_sessions();
+}
+
+void ReceiverSlot::get_metrics(ReceiverSlotMetrics& slot_metrics,
+                               ReceiverSessionMetrics* sess_metrics,
+                               size_t* sess_metrics_size) const {
+    slot_metrics = ReceiverSlotMetrics();
+    slot_metrics.num_sessions = session_group_.num_sessions();
+
+    if (sess_metrics) {
+        session_group_.get_metrics(sess_metrics, sess_metrics_size);
+    }
 }
 
 ReceiverEndpoint* ReceiverSlot::create_source_endpoint_(address::Protocol proto) {

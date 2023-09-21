@@ -16,6 +16,7 @@
 #include "roc_core/iarena.h"
 #include "roc_core/list.h"
 #include "roc_core/noncopyable.h"
+#include "roc_pipeline/metrics.h"
 #include "roc_pipeline/receiver_session.h"
 #include "roc_pipeline/receiver_state.h"
 #include "roc_rtcp/composer.h"
@@ -45,14 +46,28 @@ public:
     //! Route packet to session.
     void route_packet(const packet::PacketPtr& packet);
 
-    //! Advance session timestamp.
-    void advance_sessions(packet::timestamp_t timestamp);
+    //! Refresh pipeline according to current time.
+    //! @returns
+    //!  deadline (absolute time) when refresh should be invoked again
+    //!  if there are no frames
+    core::nanoseconds_t refresh_sessions(core::nanoseconds_t current_time);
 
     //! Adjust session clock to match consumer clock.
-    void reclock_sessions(packet::ntp_timestamp_t timestamp);
+    //! @remarks
+    //!  @p playback_time specified absolute time when first sample of last frame
+    //!  retrieved from pipeline will be actually played on sink
+    void reclock_sessions(core::nanoseconds_t playback_time);
 
     //! Get number of alive sessions.
     size_t num_sessions() const;
+
+    //! Get metrics for all sessions.
+    //! @remarks
+    //!  @p metrics defines array of metrics structs, and @p metrics_size
+    //!  defines number of array elements. Metrics are written to given array,
+    //!  and @p metrics_size is updated of actual number of elements written.
+    //!  If there is not enough space for all sessions, result is truncated.
+    void get_metrics(ReceiverSessionMetrics* metrics, size_t* metrics_size) const;
 
 private:
     // Implementation of rtcp::IReceiverHooks interface.

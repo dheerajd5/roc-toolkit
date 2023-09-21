@@ -26,7 +26,7 @@ Sender::Sender(Context& context, const pipeline::SenderConfig& pipeline_config)
                 context.sample_buffer_factory(),
                 context.arena())
     , processing_task_(pipeline_)
-    , slot_pool_(context.arena())
+    , slot_pool_("slot_pool", context.arena())
     , slot_map_(context.arena())
     , valid_(false) {
     roc_log(LogDebug, "sender node: initializing");
@@ -59,7 +59,7 @@ bool Sender::is_valid() const {
     return valid_;
 }
 
-bool Sender::configure(size_t slot_index,
+bool Sender::configure(slot_index_t slot_index,
                        address::Interface iface,
                        const netio::UdpSenderConfig& config) {
     core::Mutex::Lock lock(mutex_);
@@ -106,7 +106,7 @@ bool Sender::configure(size_t slot_index,
     return true;
 }
 
-bool Sender::connect(size_t slot_index,
+bool Sender::connect(slot_index_t slot_index,
                      address::Interface iface,
                      const address::EndpointUri& uri) {
     core::Mutex::Lock lock(mutex_);
@@ -200,7 +200,7 @@ bool Sender::connect(size_t slot_index,
     return true;
 }
 
-bool Sender::unlink(size_t slot_index) {
+bool Sender::unlink(slot_index_t slot_index) {
     core::Mutex::Lock lock(mutex_);
 
     roc_panic_if_not(is_valid());
@@ -222,6 +222,35 @@ bool Sender::unlink(size_t slot_index) {
     return true;
 }
 
+bool Sender::get_metrics(slot_index_t slot_index,
+                         pipeline::SenderSlotMetrics& slot_metrics,
+                         pipeline::SenderSessionMetrics& sess_metrics) {
+    core::Mutex::Lock lock(mutex_);
+
+    roc_panic_if_not(is_valid());
+
+    core::SharedPtr<Slot> slot = get_slot_(slot_index, false);
+    if (!slot) {
+        roc_log(LogError,
+                "sender node:"
+                " can't get metrics of slot %lu: can't find slot",
+                (unsigned long)slot_index);
+        return false;
+    }
+
+    pipeline::SenderLoop::Tasks::QuerySlot task(slot->handle, slot_metrics,
+                                                &sess_metrics);
+    if (!pipeline_.schedule_and_wait(task)) {
+        roc_log(LogError,
+                "sender node:"
+                " can't get metrics of slot %lu: operation failed",
+                (unsigned long)slot_index);
+        return false;
+    }
+
+    return true;
+}
+
 bool Sender::has_incomplete() {
     core::Mutex::Lock lock(mutex_);
 
@@ -234,11 +263,12 @@ bool Sender::has_incomplete() {
         }
 
         if (slot->handle) {
-            pipeline::SenderLoop::Tasks::PollSlot task(slot->handle);
+            pipeline::SenderSlotMetrics slot_metrics;
+            pipeline::SenderLoop::Tasks::QuerySlot task(slot->handle, slot_metrics, NULL);
             if (!pipeline_.schedule_and_wait(task)) {
                 return true;
             }
-            if (!task.get_complete()) {
+            if (!slot_metrics.is_complete) {
                 return true;
             }
         }
@@ -288,7 +318,8 @@ void Sender::update_compatibility_(address::Interface iface,
     used_protocols_[iface] = uri.proto();
 }
 
-core::SharedPtr<Sender::Slot> Sender::get_slot_(size_t slot_index, bool auto_create) {
+core::SharedPtr<Sender::Slot> Sender::get_slot_(slot_index_t slot_index,
+                                                bool auto_create) {
     core::SharedPtr<Slot> slot = slot_map_.find(slot_index);
 
     if (!slot) {

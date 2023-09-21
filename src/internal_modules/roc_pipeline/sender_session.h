@@ -29,10 +29,12 @@
 #include "roc_packet/packet_factory.h"
 #include "roc_packet/router.h"
 #include "roc_pipeline/config.h"
+#include "roc_pipeline/metrics.h"
 #include "roc_pipeline/sender_endpoint.h"
 #include "roc_rtcp/composer.h"
 #include "roc_rtcp/session.h"
 #include "roc_rtp/format_map.h"
+#include "roc_rtp/timestamp_extractor.h"
 
 namespace roc {
 namespace pipeline {
@@ -62,19 +64,21 @@ public:
     //! Get audio writer.
     audio::IFrameWriter* writer() const;
 
-    //! Get deadline when the pipeline should be updated.
-    core::nanoseconds_t get_update_deadline() const;
+    //! Refresh pipeline according to current time.
+    //! @returns
+    //!  deadline (absolute time) when refresh should be invoked again
+    //!  if there are no frames
+    core::nanoseconds_t refresh(core::nanoseconds_t current_time);
 
-    //! Update pipeline.
-    void update();
+    //! Get session metrics.
+    SenderSessionMetrics get_metrics() const;
 
 private:
     // Implementation of rtcp::ISenderHooks interface.
     // These methods are invoked by rtcp::Session.
     virtual size_t on_get_num_sources();
     virtual packet::source_t on_get_sending_source(size_t source_index);
-    virtual rtcp::SendingMetrics
-    on_get_sending_metrics(packet::ntp_timestamp_t report_time);
+    virtual rtcp::SendingMetrics on_get_sending_metrics(core::nanoseconds_t report_time);
     virtual void on_add_reception_metrics(const rtcp::ReceptionMetrics& metrics);
     virtual void on_add_link_metrics(const rtcp::LinkMetrics& metrics);
 
@@ -94,6 +98,8 @@ private:
 
     core::ScopedPtr<fec::IBlockEncoder> fec_encoder_;
     core::Optional<fec::Writer> fec_writer_;
+
+    core::Optional<rtp::TimestampExtractor> timestamp_extractor_;
 
     core::ScopedPtr<audio::IFrameEncoder> payload_encoder_;
     core::Optional<audio::Packetizer> packetizer_;

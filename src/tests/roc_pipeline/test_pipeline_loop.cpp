@@ -8,10 +8,12 @@
 
 #include <CppUTest/TestHarness.h>
 
+#include "roc_audio/frame.h"
 #include "roc_core/cond.h"
 #include "roc_core/mutex.h"
 #include "roc_core/stddefs.h"
 #include "roc_core/thread.h"
+#include "roc_core/time.h"
 #include "roc_pipeline/pipeline_loop.h"
 
 namespace roc {
@@ -35,7 +37,11 @@ const core::nanoseconds_t StartTime = 10000000 * core::Second;
 
 const core::nanoseconds_t FrameProcessingTime = 50 * core::Microsecond;
 
+const uint64_t DefaultThread = 1, ProcessingThread = 2, BackgroundThread = 3;
+
 const float Epsilon = 1e6f;
+
+const audio::SampleSpec SampleSpecs(SampleRate, audio::ChanLayout_Surround, Chans);
 
 class TestPipeline : public PipelineLoop, private IPipelineTaskScheduler {
 public:
@@ -46,9 +52,7 @@ public:
     };
 
     TestPipeline(const TaskConfig& config)
-        : PipelineLoop(*this,
-                       config,
-                       audio::SampleSpec(SampleRate, audio::ChanLayout_Surround, Chans))
+        : PipelineLoop(*this, config, SampleSpecs)
         , blocked_cond_(mutex_)
         , unblocked_cond_(mutex_)
         , blocked_counter_(0)
@@ -56,8 +60,11 @@ public:
         , frame_allow_counter_(999999)
         , task_allow_counter_(999999)
         , time_(StartTime)
+        , tid_(DefaultThread)
         , exp_frame_val_(0)
         , exp_frame_sz_(0)
+        , exp_frame_flags_(0)
+        , exp_frame_cts_(0)
         , exp_sched_deadline_(-1)
         , n_processed_frames_(0)
         , n_processed_tasks_(0)
@@ -68,6 +75,11 @@ public:
     void set_time(core::nanoseconds_t t) {
         core::Mutex::Lock lock(mutex_);
         time_ = t;
+    }
+
+    void set_tid(uint64_t t) {
+        core::Mutex::Lock lock(mutex_);
+        tid_ = t;
     }
 
     void block_frames() {
@@ -165,10 +177,15 @@ public:
         return n_sched_cancellations_;
     }
 
-    void expect_frame(audio::sample_t val, size_t sz) {
+    void expect_frame(audio::sample_t val,
+                      size_t sz,
+                      unsigned flags = 0,
+                      core::nanoseconds_t cts = 0) {
         core::Mutex::Lock lock(mutex_);
         exp_frame_val_ = val;
         exp_frame_sz_ = sz;
+        exp_frame_flags_ = flags;
+        exp_frame_cts_ = cts;
     }
 
     void expect_sched_deadline(core::nanoseconds_t d) {
@@ -184,6 +201,11 @@ private:
     virtual core::nanoseconds_t timestamp_imp() const {
         core::Mutex::Lock lock(mutex_);
         return time_;
+    }
+
+    virtual uint64_t tid_imp() const {
+        core::Mutex::Lock lock(mutex_);
+        return tid_;
     }
 
     virtual bool process_subframe_imp(audio::Frame& frame) {
@@ -202,6 +224,8 @@ private:
         for (size_t n = 0; n < exp_frame_sz_; n++) {
             roc_panic_if(std::abs(frame.samples()[n] - exp_frame_val_) > Epsilon);
         }
+        roc_panic_if(frame.flags() != exp_frame_flags_);
+        roc_panic_if(frame.capture_timestamp() != exp_frame_cts_);
         n_processed_frames_++;
         return true;
     }
@@ -256,9 +280,12 @@ private:
     int task_allow_counter_;
 
     core::nanoseconds_t time_;
+    uint64_t tid_;
 
     audio::sample_t exp_frame_val_;
     size_t exp_frame_sz_;
+    unsigned exp_frame_flags_;
+    core::nanoseconds_t exp_frame_cts_;
 
     core::nanoseconds_t exp_sched_deadline_;
 
@@ -390,7 +417,7 @@ private:
 
 } // namespace
 
-TEST_GROUP(task_pipeline) {
+TEST_GROUP(pipeline_loop) {
     audio::sample_t samples[MaxSamples];
 
     TaskConfig config;
@@ -412,7 +439,7 @@ TEST_GROUP(task_pipeline) {
     }
 };
 
-TEST(task_pipeline, schedule_and_wait_right_after_creation) {
+TEST(pipeline_loop, schedule_and_wait_right_after_creation) {
     TestPipeline pipeline(config);
 
     TestPipeline::Task task;
@@ -437,7 +464,7 @@ TEST(task_pipeline, schedule_and_wait_right_after_creation) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_right_after_creation) {
+TEST(pipeline_loop, schedule_right_after_creation) {
     TestPipeline pipeline(config);
 
     TestCompleter completer(pipeline);
@@ -465,7 +492,7 @@ TEST(task_pipeline, schedule_right_after_creation) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_can_process_tasks) {
+TEST(pipeline_loop, schedule_when_can_process_tasks) {
     TestPipeline pipeline(config);
 
     audio::Frame frame(samples, FrameSize);
@@ -474,11 +501,17 @@ TEST(task_pipeline, schedule_when_can_process_tasks) {
 
     pipeline.set_time(StartTime);
 
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
     // process_subframes_and_tasks() should allow task processing
     // until (StartTime + FrameSize * core::Microsecond - NoTaskProcessingGap / 2)
     CHECK(pipeline.process_subframes_and_tasks(frame));
 
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_frames());
+
+    // further calls are done from "background thread"
+    pipeline.set_tid(BackgroundThread);
 
     TestCompleter completer(pipeline);
     TestPipeline::Task task;
@@ -505,7 +538,7 @@ TEST(task_pipeline, schedule_when_can_process_tasks) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_frame) {
+TEST(pipeline_loop, schedule_when_cant_process_tasks_but_from_processing_thread) {
     TestPipeline pipeline(config);
 
     audio::Frame frame1(samples, FrameSize);
@@ -514,11 +547,61 @@ TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_frame) {
 
     pipeline.set_time(StartTime);
 
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
     // process_subframes_and_tasks() should allow task processing
     // until (StartTime + FrameSize * core::Microsecond - NoTaskProcessingGap / 2)
     CHECK(pipeline.process_subframes_and_tasks(frame1));
 
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_frames());
+
+    TestCompleter completer(pipeline);
+    TestPipeline::Task task;
+
+    // deadline expired
+    pipeline.set_time(StartTime + FrameSize * core::Microsecond
+                      - NoTaskProcessingGap / 2);
+
+    // schedule() should process task in-place even when deadline expired,
+    // because we're still on "processing thread"
+    pipeline.schedule(task, completer);
+
+    POINTERS_EQUAL(&task, completer.get_task());
+
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_pending_tasks());
+    UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_tasks());
+
+    UNSIGNED_LONGS_EQUAL(1, pipeline.num_tasks_processed_in_sched());
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_tasks_processed_in_frame());
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_tasks_processed_in_proc());
+
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_sched_calls());
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_sched_cancellations());
+
+    UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
+}
+
+TEST(pipeline_loop, schedule_when_cant_process_tasks_then_process_frame) {
+    TestPipeline pipeline(config);
+
+    audio::Frame frame1(samples, FrameSize);
+    fill_frame(frame1, 0.1f, 0, FrameSize);
+    pipeline.expect_frame(0.1f, FrameSize);
+
+    pipeline.set_time(StartTime);
+
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
+    // process_subframes_and_tasks() should allow task processing
+    // until (StartTime + FrameSize * core::Microsecond - NoTaskProcessingGap / 2)
+    CHECK(pipeline.process_subframes_and_tasks(frame1));
+
+    UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_frames());
+
+    // further calls are done from "background thread"
+    pipeline.set_tid(BackgroundThread);
 
     TestCompleter completer(pipeline);
     TestPipeline::Task task;
@@ -552,11 +635,17 @@ TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_frame) {
 
     pipeline.set_time(StartTime + FrameSize * core::Microsecond);
 
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
     // process_subframes_and_tasks() should call cancel_task_processing() and
     // process the task from the queue
     CHECK(pipeline.process_subframes_and_tasks(frame2));
 
     UNSIGNED_LONGS_EQUAL(2, pipeline.num_processed_frames());
+
+    // further calls are done from "background thread"
+    pipeline.set_tid(BackgroundThread);
 
     POINTERS_EQUAL(&task, completer.get_task());
 
@@ -573,7 +662,7 @@ TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_frame) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_tasks) {
+TEST(pipeline_loop, schedule_when_cant_process_tasks_then_process_tasks) {
     TestPipeline pipeline(config);
 
     audio::Frame frame1(samples, FrameSize);
@@ -582,11 +671,17 @@ TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_tasks) {
 
     pipeline.set_time(StartTime);
 
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
     // process_subframes_and_tasks() should allow task processing
     // until (StartTime + FrameSize * core::Microsecond - NoTaskProcessingGap / 2)
     CHECK(pipeline.process_subframes_and_tasks(frame1));
 
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_frames());
+
+    // further calls are done from "background thread"
+    pipeline.set_tid(BackgroundThread);
 
     TestCompleter completer(pipeline);
     TestPipeline::Task task;
@@ -654,7 +749,7 @@ TEST(task_pipeline, schedule_when_cant_process_tasks_then_process_tasks) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_another_schedule_is_running_then_process_tasks) {
+TEST(pipeline_loop, schedule_when_another_schedule_is_running_then_process_tasks) {
     TestPipeline pipeline(config);
     TestCompleter completer(pipeline);
 
@@ -736,7 +831,7 @@ TEST(task_pipeline, schedule_when_another_schedule_is_running_then_process_tasks
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_process_tasks_is_running) {
+TEST(pipeline_loop, schedule_when_process_tasks_is_running) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -844,7 +939,7 @@ TEST(task_pipeline, schedule_when_process_tasks_is_running) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_when_processing_frame) {
+TEST(pipeline_loop, schedule_when_processing_frame) {
     TestPipeline pipeline(config);
 
     audio::Frame frame(samples, FrameSize);
@@ -904,7 +999,7 @@ TEST(task_pipeline, schedule_when_processing_frame) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_tasks_when_schedule_is_running) {
+TEST(pipeline_loop, process_tasks_when_schedule_is_running) {
     TestPipeline pipeline(config);
 
     // next process_task_imp() call will block
@@ -954,7 +1049,7 @@ TEST(task_pipeline, process_tasks_when_schedule_is_running) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_tasks_when_another_process_tasks_is_running) {
+TEST(pipeline_loop, process_tasks_when_another_process_tasks_is_running) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1056,7 +1151,7 @@ TEST(task_pipeline, process_tasks_when_another_process_tasks_is_running) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_tasks_when_processing_frame) {
+TEST(pipeline_loop, process_tasks_when_processing_frame) {
     TestPipeline pipeline(config);
 
     audio::Frame frame(samples, FrameSize);
@@ -1119,7 +1214,7 @@ TEST(task_pipeline, process_tasks_when_processing_frame) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_tasks_interframe_deadline) {
+TEST(pipeline_loop, process_tasks_interframe_deadline) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1128,8 +1223,14 @@ TEST(task_pipeline, process_tasks_interframe_deadline) {
     fill_frame(frame, 0.1f, 0, FrameSize);
     pipeline.expect_frame(0.1f, FrameSize);
 
+    // next call is done from "processing thread"
+    pipeline.set_tid(ProcessingThread);
+
     // process frame and set inter-frame task processing deadline
     CHECK(pipeline.process_subframes_and_tasks(frame));
+
+    // further calls are done from "background thread"
+    pipeline.set_tid(BackgroundThread);
 
     // next process_task_imp() call will block
     pipeline.block_tasks();
@@ -1272,7 +1373,7 @@ TEST(task_pipeline, process_tasks_interframe_deadline) {
     POINTERS_EQUAL(&task3, completer3.get_task());
 }
 
-TEST(task_pipeline, process_frame_when_schedule_is_running) {
+TEST(pipeline_loop, process_frame_when_schedule_is_running) {
     TestPipeline pipeline(config);
     TestCompleter completer(pipeline);
 
@@ -1381,7 +1482,7 @@ TEST(task_pipeline, process_frame_when_schedule_is_running) {
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_frame_when_process_tasks_is_running) {
+TEST(pipeline_loop, process_frame_when_process_tasks_is_running) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1529,7 +1630,7 @@ TEST(task_pipeline, process_frame_when_process_tasks_is_running) {
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, process_frame_max_samples_between_frames) {
+TEST(pipeline_loop, process_frame_max_samples_between_frames) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1692,7 +1793,7 @@ TEST(task_pipeline, process_frame_max_samples_between_frames) {
     POINTERS_EQUAL(&task3, completer3.get_task());
 }
 
-TEST(task_pipeline, process_frame_min_samples_between_frames) {
+TEST(pipeline_loop, process_frame_min_samples_between_frames) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1770,7 +1871,7 @@ TEST(task_pipeline, process_frame_min_samples_between_frames) {
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_sched_cancellations());
 }
 
-TEST(task_pipeline, schedule_from_completion_completer_called_in_place) {
+TEST(pipeline_loop, schedule_from_completion_completer_called_in_place) {
     TestPipeline pipeline(config);
 
     TestPipeline::Task task1;
@@ -1829,7 +1930,7 @@ TEST(task_pipeline, schedule_from_completion_completer_called_in_place) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_preemptions());
 }
 
-TEST(task_pipeline, schedule_from_completion_completer_called_from_process_tasks) {
+TEST(pipeline_loop, schedule_from_completion_completer_called_from_process_tasks) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1902,7 +2003,7 @@ TEST(task_pipeline, schedule_from_completion_completer_called_from_process_tasks
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_sched_cancellations());
 }
 
-TEST(task_pipeline, schedule_from_completion_completer_called_from_process_frame) {
+TEST(pipeline_loop, schedule_from_completion_completer_called_from_process_frame) {
     TestPipeline pipeline(config);
 
     pipeline.set_time(StartTime);
@@ -1980,7 +2081,7 @@ TEST(task_pipeline, schedule_from_completion_completer_called_from_process_frame
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_sched_cancellations());
 }
 
-TEST(task_pipeline, schedule_and_wait_until_process_tasks_called) {
+TEST(pipeline_loop, schedule_and_wait_until_process_tasks_called) {
     TestPipeline pipeline(config);
     TestCompleter completer(pipeline);
 
@@ -2088,7 +2189,7 @@ TEST(task_pipeline, schedule_and_wait_until_process_tasks_called) {
     UNSIGNED_LONGS_EQUAL(0, pipeline.num_sched_cancellations());
 }
 
-TEST(task_pipeline, schedule_and_wait_until_process_frame_called) {
+TEST(pipeline_loop, schedule_and_wait_until_process_frame_called) {
     TestPipeline pipeline(config);
     TestCompleter completer(pipeline);
 
@@ -2198,6 +2299,56 @@ TEST(task_pipeline, schedule_and_wait_until_process_frame_called) {
 
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_sched_calls());
     UNSIGNED_LONGS_EQUAL(1, pipeline.num_sched_cancellations());
+}
+
+TEST(pipeline_loop, forward_flags_and_cts_small_frame) {
+    TestPipeline pipeline(config);
+
+    const unsigned frame_flags = audio::Frame::FlagNonblank;
+    const core::nanoseconds_t frame_cts = 1000000000;
+
+    audio::Frame frame(samples, FrameSize);
+    fill_frame(frame, 0.1f, 0, FrameSize);
+    frame.set_flags(frame_flags);
+    frame.set_capture_timestamp(frame_cts);
+
+    pipeline.set_time(StartTime);
+    pipeline.expect_frame(0.1f, FrameSize, frame_flags, frame_cts);
+
+    CHECK(pipeline.process_subframes_and_tasks(frame));
+
+    UNSIGNED_LONGS_EQUAL(1, pipeline.num_processed_frames());
+}
+
+TEST(pipeline_loop, forward_flags_and_cts_large_frame) {
+    TestPipeline pipeline(config);
+
+    const unsigned frame_flags = audio::Frame::FlagNonblank;
+    const core::nanoseconds_t frame_cts = 1000000000;
+
+    audio::Frame frame(samples, MaxFrameSize * 2);
+    fill_frame(frame, 0.1f, 0, MaxFrameSize * 2);
+    frame.set_flags(frame_flags);
+    frame.set_capture_timestamp(frame_cts);
+
+    pipeline.set_time(StartTime);
+    pipeline.block_frames();
+
+    AsyncFrameWriter fw(pipeline, frame);
+    CHECK(fw.start());
+
+    pipeline.wait_blocked();
+    pipeline.expect_frame(0.1f, MaxFrameSize, frame_flags, frame_cts);
+    pipeline.unblock_one_frame();
+
+    pipeline.wait_blocked();
+    pipeline.expect_frame(0.1f, MaxFrameSize, frame_flags,
+                          frame_cts + SampleSpecs.samples_overall_2_ns(MaxFrameSize));
+    pipeline.unblock_one_frame();
+
+    fw.join();
+
+    UNSIGNED_LONGS_EQUAL(2, pipeline.num_processed_frames());
 }
 
 } // namespace pipeline

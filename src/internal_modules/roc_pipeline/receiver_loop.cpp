@@ -10,6 +10,7 @@
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
 #include "roc_core/shared_ptr.h"
+#include "roc_core/thread.h"
 
 namespace roc {
 namespace pipeline {
@@ -19,7 +20,10 @@ ReceiverLoop::Task::Task()
     , slot_(NULL)
     , iface_(address::Iface_Invalid)
     , proto_(address::Proto_None)
-    , writer_(NULL) {
+    , writer_(NULL)
+    , slot_metrics_(NULL)
+    , sess_metrics_(NULL)
+    , sess_metrics_size_(NULL) {
 }
 
 ReceiverLoop::Tasks::CreateSlot::CreateSlot() {
@@ -40,6 +44,20 @@ ReceiverLoop::Tasks::DeleteSlot::DeleteSlot(SlotHandle slot) {
         roc_panic("receiver loop: slot handle is null");
     }
     slot_ = (ReceiverSlot*)slot;
+}
+
+ReceiverLoop::Tasks::QuerySlot::QuerySlot(SlotHandle slot,
+                                          ReceiverSlotMetrics& slot_metrics,
+                                          ReceiverSessionMetrics* sess_metrics,
+                                          size_t* sess_metrics_size) {
+    func_ = &ReceiverLoop::task_query_slot_;
+    if (!slot) {
+        roc_panic("receiver loop: slot handle is null");
+    }
+    slot_ = (ReceiverSlot*)slot;
+    slot_metrics_ = &slot_metrics;
+    sess_metrics_ = sess_metrics;
+    sess_metrics_size_ = sess_metrics_size;
 }
 
 ReceiverLoop::Tasks::AddEndpoint::AddEndpoint(SlotHandle slot,
@@ -76,7 +94,8 @@ ReceiverLoop::ReceiverLoop(IPipelineTaskScheduler& scheduler,
               byte_buffer_factory,
               sample_buffer_factory,
               arena)
-    , timestamp_(0)
+    , ticker_ts_(0)
+    , auto_reclock_(false)
     , valid_(false) {
     if (!source_.is_valid()) {
         return;
@@ -89,6 +108,8 @@ ReceiverLoop::ReceiverLoop(IPipelineTaskScheduler& scheduler,
             return;
         }
     }
+
+    auto_reclock_ = config.common.enable_auto_reclock;
 
     valid_ = true;
 }
@@ -159,6 +180,14 @@ core::nanoseconds_t ReceiverLoop::latency() const {
     return source_.latency();
 }
 
+bool ReceiverLoop::has_latency() const {
+    roc_panic_if(!is_valid());
+
+    core::Mutex::Lock lock(source_mutex_);
+
+    return source_.has_latency();
+}
+
 bool ReceiverLoop::has_clock() const {
     roc_panic_if(!is_valid());
 
@@ -167,8 +196,12 @@ bool ReceiverLoop::has_clock() const {
     return source_.has_clock();
 }
 
-void ReceiverLoop::reclock(packet::ntp_timestamp_t timestamp) {
+void ReceiverLoop::reclock(core::nanoseconds_t timestamp) {
     roc_panic_if(!is_valid());
+
+    if (auto_reclock_) {
+        roc_panic("receiver loop: unexpected reclock() call in auto-reclock mode");
+    }
 
     core::Mutex::Lock lock(source_mutex_);
 
@@ -181,16 +214,18 @@ bool ReceiverLoop::read(audio::Frame& frame) {
     core::Mutex::Lock lock(source_mutex_);
 
     if (ticker_) {
-        ticker_->wait(timestamp_);
+        ticker_->wait(ticker_ts_);
+        ticker_ts_ += frame.num_samples() / source_.sample_spec().num_channels();
     }
 
-    // Invokes process_subframe_imp() and process_task_imp().
+    // invokes process_subframe_imp() and process_task_imp()
     if (!process_subframes_and_tasks(frame)) {
         return false;
     }
 
-    timestamp_ +=
-        packet::timestamp_t(frame.num_samples() / source_.sample_spec().num_channels());
+    if (auto_reclock_) {
+        source_.reclock(core::timestamp(core::ClockUnix));
+    }
 
     return true;
 }
@@ -199,7 +234,14 @@ core::nanoseconds_t ReceiverLoop::timestamp_imp() const {
     return core::timestamp(core::ClockMonotonic);
 }
 
+uint64_t ReceiverLoop::tid_imp() const {
+    return core::Thread::get_tid();
+}
+
 bool ReceiverLoop::process_subframe_imp(audio::Frame& frame) {
+    // TODO: handle returned deadline and schedule refresh
+    source_.refresh(core::timestamp(core::ClockUnix));
+
     return source_.read(frame);
 }
 
@@ -219,6 +261,15 @@ bool ReceiverLoop::task_delete_slot_(Task& task) {
     roc_panic_if(!task.slot_);
 
     source_.delete_slot(task.slot_);
+    return true;
+}
+
+bool ReceiverLoop::task_query_slot_(Task& task) {
+    roc_panic_if(!task.slot_);
+    roc_panic_if(!task.slot_metrics_);
+
+    task.slot_->get_metrics(*task.slot_metrics_, task.sess_metrics_,
+                            task.sess_metrics_size_);
     return true;
 }
 

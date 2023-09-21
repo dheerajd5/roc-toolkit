@@ -10,6 +10,7 @@
 #include "roc_audio/resampler_map.h"
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
+#include "roc_core/thread.h"
 
 namespace roc {
 namespace pipeline {
@@ -21,7 +22,8 @@ SenderLoop::Task::Task()
     , iface_(address::Iface_Invalid)
     , proto_(address::Proto_None)
     , writer_(NULL)
-    , is_complete_(false) {
+    , slot_metrics_(NULL)
+    , sess_metrics_(NULL) {
 }
 
 SenderLoop::Tasks::CreateSlot::CreateSlot() {
@@ -44,20 +46,16 @@ SenderLoop::Tasks::DeleteSlot::DeleteSlot(SlotHandle slot) {
     slot_ = (SenderSlot*)slot;
 }
 
-SenderLoop::Tasks::PollSlot::PollSlot(SlotHandle slot) {
-    func_ = &SenderLoop::task_poll_slot_;
+SenderLoop::Tasks::QuerySlot::QuerySlot(SlotHandle slot,
+                                        SenderSlotMetrics& slot_metrics,
+                                        SenderSessionMetrics* sess_metrics) {
+    func_ = &SenderLoop::task_query_slot_;
     if (!slot) {
         roc_panic("sender loop: slot handle is null");
     }
     slot_ = (SenderSlot*)slot;
-}
-
-bool SenderLoop::Tasks::PollSlot::get_complete() const {
-    if (!success()) {
-        return false;
-    }
-    roc_panic_if_not(slot_);
-    return is_complete_;
+    slot_metrics_ = &slot_metrics;
+    sess_metrics_ = sess_metrics;
 }
 
 SenderLoop::Tasks::AddEndpoint::AddEndpoint(SlotHandle slot,
@@ -98,7 +96,8 @@ SenderLoop::SenderLoop(IPipelineTaskScheduler& scheduler,
             byte_buffer_factory,
             sample_buffer_factory,
             arena)
-    , timestamp_(0)
+    , ticker_ts_(0)
+    , auto_cts_(false)
     , valid_(false) {
     if (!sink_.is_valid()) {
         return;
@@ -110,6 +109,8 @@ SenderLoop::SenderLoop(IPipelineTaskScheduler& scheduler,
             return;
         }
     }
+
+    auto_cts_ = config.enable_auto_cts;
 
     valid_ = true;
 }
@@ -180,6 +181,14 @@ core::nanoseconds_t SenderLoop::latency() const {
     return sink_.latency();
 }
 
+bool SenderLoop::has_latency() const {
+    roc_panic_if_not(is_valid());
+
+    core::Mutex::Lock lock(sink_mutex_);
+
+    return sink_.has_latency();
+}
+
 bool SenderLoop::has_clock() const {
     roc_panic_if_not(is_valid());
 
@@ -191,31 +200,39 @@ bool SenderLoop::has_clock() const {
 void SenderLoop::write(audio::Frame& frame) {
     roc_panic_if_not(is_valid());
 
+    if (auto_cts_) {
+        if (frame.capture_timestamp() != 0) {
+            roc_panic("sender loop: unexpected non-zero cts in auto-cts mode");
+        }
+        frame.set_capture_timestamp(core::timestamp(core::ClockUnix));
+    }
+
     core::Mutex::Lock lock(sink_mutex_);
 
     if (ticker_) {
-        ticker_->wait(timestamp_);
+        ticker_->wait(ticker_ts_);
+        ticker_ts_ += frame.num_samples() / sink_.sample_spec().num_channels();
     }
 
-    // Invokes process_subframe_imp() and process_task_imp().
+    // invokes process_subframe_imp() and process_task_imp()
     if (!process_subframes_and_tasks(frame)) {
         return;
     }
-
-    timestamp_ +=
-        packet::timestamp_t(frame.num_samples() / sink_.sample_spec().num_channels());
 }
 
 core::nanoseconds_t SenderLoop::timestamp_imp() const {
     return core::timestamp(core::ClockMonotonic);
 }
 
+uint64_t SenderLoop::tid_imp() const {
+    return core::Thread::get_tid();
+}
+
 bool SenderLoop::process_subframe_imp(audio::Frame& frame) {
     sink_.write(frame);
 
-    if (sink_.get_update_deadline() <= core::timestamp(core::ClockMonotonic)) {
-        sink_.update();
-    }
+    // TODO: handle returned deadline and schedule refresh
+    sink_.refresh(core::timestamp(core::ClockUnix));
 
     return true;
 }
@@ -239,10 +256,11 @@ bool SenderLoop::task_delete_slot_(Task& task) {
     return true;
 }
 
-bool SenderLoop::task_poll_slot_(Task& task) {
+bool SenderLoop::task_query_slot_(Task& task) {
     roc_panic_if(!task.slot_);
+    roc_panic_if(!task.slot_metrics_);
 
-    task.is_complete_ = task.slot_->is_complete();
+    task.slot_->get_metrics(*task.slot_metrics_, task.sess_metrics_);
     return true;
 }
 

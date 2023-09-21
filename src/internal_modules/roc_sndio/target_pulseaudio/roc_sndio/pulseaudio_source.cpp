@@ -48,11 +48,15 @@ core::nanoseconds_t PulseaudioSource::latency() const {
     return PulseaudioDevice::latency();
 }
 
-bool PulseaudioSource::has_clock() const {
-    return PulseaudioDevice::has_clock();
+bool PulseaudioSource::has_latency() const {
+    return true;
 }
 
-void PulseaudioSource::reclock(packet::ntp_timestamp_t) {
+bool PulseaudioSource::has_clock() const {
+    return true;
+}
+
+void PulseaudioSource::reclock(core::nanoseconds_t) {
     // no-op
 }
 

@@ -28,9 +28,8 @@ ReceiverSource::ReceiverSource(
     , sample_buffer_factory_(sample_buffer_factory)
     , arena_(arena)
     , audio_reader_(NULL)
-    , config_(config)
-    , timestamp_(0) {
-    mixer_.reset(new (mixer_) audio::Mixer(sample_buffer_factory));
+    , config_(config) {
+    mixer_.reset(new (mixer_) audio::Mixer(sample_buffer_factory, true));
     if (!mixer_ || !mixer_->is_valid()) {
         return;
     }
@@ -88,6 +87,27 @@ size_t ReceiverSource::num_sessions() const {
     return state_.num_sessions();
 }
 
+core::nanoseconds_t ReceiverSource::refresh(core::nanoseconds_t current_time) {
+    roc_panic_if(!is_valid());
+
+    core::nanoseconds_t next_deadline = 0;
+
+    for (core::SharedPtr<ReceiverSlot> slot = slots_.front(); slot;
+         slot = slots_.nextof(*slot)) {
+        const core::nanoseconds_t slot_deadline = slot->refresh(current_time);
+
+        if (slot_deadline != 0) {
+            if (next_deadline == 0) {
+                next_deadline = slot_deadline;
+            } else {
+                next_deadline = std::min(next_deadline, slot_deadline);
+            }
+        }
+    }
+
+    return next_deadline;
+}
+
 sndio::DeviceType ReceiverSource::type() const {
     return sndio::DeviceType_Source;
 }
@@ -129,35 +149,27 @@ core::nanoseconds_t ReceiverSource::latency() const {
     return 0;
 }
 
+bool ReceiverSource::has_latency() const {
+    return false;
+}
+
 bool ReceiverSource::has_clock() const {
     return config_.common.enable_timing;
 }
 
-void ReceiverSource::reclock(packet::ntp_timestamp_t timestamp) {
+void ReceiverSource::reclock(core::nanoseconds_t playback_time) {
     roc_panic_if(!is_valid());
 
     for (core::SharedPtr<ReceiverSlot> slot = slots_.front(); slot;
          slot = slots_.nextof(*slot)) {
-        slot->reclock(timestamp);
+        slot->reclock(playback_time);
     }
 }
 
 bool ReceiverSource::read(audio::Frame& frame) {
     roc_panic_if(!is_valid());
 
-    for (core::SharedPtr<ReceiverSlot> slot = slots_.front(); slot;
-         slot = slots_.nextof(*slot)) {
-        slot->advance(timestamp_);
-    }
-
-    if (!audio_reader_->read(frame)) {
-        return false;
-    }
-
-    timestamp_ += packet::timestamp_t(frame.num_samples()
-                                      / config_.common.output_sample_spec.num_channels());
-
-    return true;
+    return audio_reader_->read(frame);
 }
 
 } // namespace pipeline

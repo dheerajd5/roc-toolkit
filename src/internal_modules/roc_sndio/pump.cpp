@@ -57,6 +57,7 @@ bool Pump::run() {
     ISource* current_source = &main_source_;
 
     while (!stop_) {
+        // switch between main and backup sources when necessary
         if (main_source_.state() == DeviceState_Active) {
             if (current_source == backup_source_) {
                 roc_log(LogInfo, "pump: switching to main source");
@@ -86,8 +87,10 @@ bool Pump::run() {
             }
         }
 
+        // read frame
         audio::Frame frame(frame_buffer_.data(), frame_buffer_.size());
 
+        // if source has clock, here we block on it
         if (!current_source->read(frame)) {
             roc_log(LogDebug, "pump: got eof from source");
 
@@ -99,10 +102,41 @@ bool Pump::run() {
             }
         }
 
+        if (frame.capture_timestamp() == 0) {
+            // if source does not provide capture timestamps, we fill them here
+            // we subtract source latency to take into account recording buffer size,
+            // where this frame spent some time before we read it
+            // we subtract frame size because we already read the whole frame from
+            // recording buffer, and should take it into account too
+            core::nanoseconds_t capture_latency = 0;
+
+            if (current_source->has_latency()) {
+                capture_latency = current_source->latency()
+                    + sample_spec_.samples_overall_2_ns(frame.num_samples());
+            }
+
+            frame.set_capture_timestamp(core::timestamp(core::ClockUnix)
+                                        - capture_latency);
+        }
+
+        // if sink has clock, here we block on it
+        // note that either source or sink has clock, but not both
         sink_.write(frame);
 
-        current_source->reclock(packet::ntp_timestamp()
-                                + packet::nanoseconds_2_ntp(sink_.latency()));
+        {
+            // tell source what is playback time of first sample of last read frame
+            // we add sink latency to take into account playback buffer size
+            // we subtract frame size because we already wrote the whole frame into
+            // playback buffer, and should take it into account too
+            core::nanoseconds_t playback_latency = 0;
+
+            if (sink_.has_latency()) {
+                playback_latency = sink_.latency()
+                    - sample_spec_.samples_overall_2_ns(frame.num_samples());
+            }
+
+            current_source->reclock(core::timestamp(core::ClockUnix) + playback_latency);
+        }
 
         if (current_source == &main_source_) {
             n_bufs_++;

@@ -35,6 +35,46 @@ const ResamplerMethod resampler_methods[] = { Reader, Writer };
 core::HeapArena arena;
 core::BufferFactory<sample_t> buffer_factory(arena, MaxFrameSize);
 
+class TimestampChecker : public IFrameWriter {
+public:
+    TimestampChecker(const core::nanoseconds_t capt_ts,
+                     const core::nanoseconds_t epsilon,
+                     const audio::SampleSpec& sample_spec)
+        : capt_ts_(capt_ts)
+        , epsilon_(epsilon)
+        , sample_spec_(sample_spec)
+        , scale_(1.f)
+        , start_(true) {
+    }
+
+    void set_scaling(const sample_t scale) {
+        scale_ = scale;
+    }
+
+    virtual void write(Frame& frame) {
+        if (capt_ts_ && epsilon_) {
+            if (start_) {
+                start_ = false;
+                CHECK(frame.capture_timestamp() >= capt_ts_);
+                capt_ts_ = frame.capture_timestamp();
+            } else {
+                CHECK(
+                    core::ns_equal_delta(capt_ts_, frame.capture_timestamp(), epsilon_));
+            }
+            capt_ts_ += core::nanoseconds_t(
+                sample_spec_.samples_overall_2_ns(frame.num_samples()) * scale_);
+        }
+    }
+
+private:
+    core::nanoseconds_t capt_ts_;
+    core::nanoseconds_t epsilon_;
+    const audio::SampleSpec& sample_spec_;
+    sample_t scale_;
+
+    bool start_;
+};
+
 void generate_sine(sample_t* out, size_t num_samples, size_t num_padding) {
     for (size_t n = 0; n < num_samples; n++) {
         out[n] = n < num_padding
@@ -109,13 +149,13 @@ void resample_reader(IResampler& resampler,
                      sample_t* in,
                      sample_t* out,
                      size_t num_samples,
-                     const audio::SampleSpec& sample_spec,
+                     const SampleSpec& sample_spec,
                      float scaling) {
     test::MockReader input_reader;
     for (size_t n = 0; n < num_samples; n++) {
-        input_reader.add(1, in[n]);
+        input_reader.add_samples(1, in[n]);
     }
-    input_reader.pad_zeros();
+    input_reader.add_zero_samples();
 
     ResamplerReader rr(input_reader, resampler, sample_spec, sample_spec);
     CHECK(rr.is_valid());
@@ -134,7 +174,7 @@ void resample_writer(IResampler& resampler,
                      sample_t* in,
                      sample_t* out,
                      size_t num_samples,
-                     const audio::SampleSpec& sample_spec,
+                     const SampleSpec& sample_spec,
                      float scaling) {
     test::MockWriter output_writer;
 
@@ -164,7 +204,7 @@ void resample(ResamplerBackend backend,
               sample_t* in,
               sample_t* out,
               size_t num_samples,
-              const audio::SampleSpec& sample_spec,
+              const SampleSpec& sample_spec,
               float scaling) {
     core::ScopedPtr<IResampler> resampler(
         ResamplerMap::instance().new_resampler(backend, arena, buffer_factory,
@@ -197,11 +237,11 @@ TEST(resampler, supported_scalings) {
         ResamplerBackend backend = ResamplerMap::instance().nth_backend(n_back);
         for (size_t pn = 0; pn < ROC_ARRAY_SIZE(profiles); pn++) {
             for (size_t irate = 0; irate < ROC_ARRAY_SIZE(rates); irate++) {
-                const audio::SampleSpec in_sample_specs =
-                    SampleSpec(rates[irate], audio::ChanLayout_Surround, ChMask);
+                const SampleSpec in_sample_specs =
+                    SampleSpec(rates[irate], ChanLayout_Surround, ChMask);
                 for (size_t orate = 0; orate < ROC_ARRAY_SIZE(rates); orate++) {
-                    const audio::SampleSpec out_sample_specs =
-                        SampleSpec(rates[orate], audio::ChanLayout_Surround, ChMask);
+                    const SampleSpec out_sample_specs =
+                        SampleSpec(rates[orate], ChanLayout_Surround, ChMask);
                     for (size_t sn = 0; sn < ROC_ARRAY_SIZE(scalings); sn++) {
                         core::ScopedPtr<IResampler> resampler(
                             ResamplerMap::instance().new_resampler(
@@ -212,7 +252,7 @@ TEST(resampler, supported_scalings) {
                         CHECK(resampler->is_valid());
 
                         test::MockReader input_reader;
-                        input_reader.pad_zeros();
+                        input_reader.add_zero_samples();
 
                         ResamplerReader rr(input_reader, *resampler, in_sample_specs,
                                            out_sample_specs);
@@ -241,7 +281,7 @@ TEST(resampler, supported_scalings) {
 
 TEST(resampler, invalid_scalings) {
     enum { SampleRate = 44100, ChMask = 0x1 };
-    const audio::SampleSpec SampleSpecs(SampleRate, audio::ChanLayout_Surround, ChMask);
+    const SampleSpec SampleSpecs(SampleRate, ChanLayout_Surround, ChMask);
 
     for (size_t n_back = 0; n_back < ResamplerMap::instance().num_backends(); n_back++) {
         ResamplerBackend backend = ResamplerMap::instance().nth_backend(n_back);
@@ -272,7 +312,7 @@ TEST(resampler, upscale_downscale_mono) {
         NumTruncate = 8 * OutFrameSize,
         NumSamples = 50 * OutFrameSize
     };
-    const audio::SampleSpec SampleSpecs(SampleRate, audio::ChanLayout_Surround, ChMask);
+    const SampleSpec SampleSpecs(SampleRate, ChanLayout_Surround, ChMask);
 
     const float Scaling = 0.97f;
     const float Threshold = 0.06f;
@@ -335,7 +375,7 @@ TEST(resampler, upscale_downscale_stereo) {
         NumTruncate = 8 * OutFrameSize,
         NumSamples = 50 * OutFrameSize
     };
-    const audio::SampleSpec SampleSpecs(SampleRate, audio::ChanLayout_Surround, ChMask);
+    const SampleSpec SampleSpecs(SampleRate, ChanLayout_Surround, ChMask);
 
     const float Scaling = 0.97f;
     const float Threshold = 0.06f;
@@ -397,6 +437,202 @@ TEST(resampler, upscale_downscale_stereo) {
                               " backend=%d method=%d",
                               (int)backend, (int)method);
                 }
+            }
+        }
+    }
+}
+
+// Testing how resampler deals with timestamps: output frame timestamp must accumulate
+// number of previous sammples multiplid by immediate sample rate.
+TEST(resampler, timestamp_passthrough_reader) {
+    enum {
+        InSampleRate = 44100,
+        OutSampleRate = 48000,
+        NumCh = 2,
+        ChMask = 0x3,
+        FrameLen = 178
+    };
+    const SampleSpec InSampleSpecs =
+        SampleSpec(InSampleRate, ChanLayout_Surround, ChMask);
+    const SampleSpec OutSampleSpecs =
+        SampleSpec(OutSampleRate, ChanLayout_Surround, ChMask);
+
+    for (size_t n_back = 0; n_back < ResamplerMap::instance().num_backends(); n_back++) {
+        ResamplerBackend backend = ResamplerMap::instance().nth_backend(n_back);
+        core::ScopedPtr<IResampler> resampler(
+            ResamplerMap::instance().new_resampler(backend, arena, buffer_factory,
+                                                   ResamplerProfile_High, InSampleSpecs,
+                                                   OutSampleSpecs),
+            arena);
+
+        const core::nanoseconds_t start_ts = 1691499037871419405;
+        core::nanoseconds_t cur_ts = start_ts;
+        core::nanoseconds_t ts_step;
+
+        // Time Stamp allowance. Built in resampler passess the test with 0.1 --
+        // much better.
+        const core::nanoseconds_t epsilon =
+            core::nanoseconds_t(1. / InSampleRate * core::Second);
+
+        test::MockReader input_reader;
+        input_reader.enable_timestamps(start_ts, InSampleSpecs);
+        input_reader.add_zero_samples();
+        ResamplerReader rreader(input_reader, *resampler, InSampleSpecs, OutSampleSpecs);
+        // Immediate sample rate.
+        float scale = 1.0f;
+
+        CHECK(rreader.set_scaling(scale));
+        ts_step =
+            core::nanoseconds_t(OutSampleSpecs.samples_overall_2_ns(FrameLen) * scale);
+
+        sample_t samples[FrameLen];
+
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                CHECK(frame.capture_timestamp() >= start_ts);
+                cur_ts = frame.capture_timestamp();
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                cur_ts += ts_step;
+                CHECK(core::ns_equal_delta(frame.capture_timestamp(), cur_ts, epsilon));
+            }
+        }
+
+        scale = 0.95f;
+        rreader.set_scaling(scale);
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                cur_ts += ts_step;
+                CHECK(core::ns_equal_delta(frame.capture_timestamp(), cur_ts, epsilon));
+                ts_step = core::nanoseconds_t(
+                    OutSampleSpecs.samples_overall_2_ns(FrameLen) * scale);
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                cur_ts += ts_step;
+                CHECK(core::ns_equal_delta(frame.capture_timestamp(), cur_ts, epsilon));
+            }
+        }
+
+        scale = 1.05f;
+        rreader.set_scaling(scale);
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                cur_ts += ts_step;
+                CHECK(core::ns_equal_delta(frame.capture_timestamp(), cur_ts, epsilon));
+                ts_step = core::nanoseconds_t(
+                    OutSampleSpecs.samples_overall_2_ns(FrameLen) * scale);
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                CHECK(rreader.read(frame));
+                cur_ts += ts_step;
+                CHECK(core::ns_equal_delta(frame.capture_timestamp(), cur_ts, epsilon));
+            }
+        }
+    }
+}
+
+// Tests resampler writer ability to pass through capture timestamps of frames.
+// It copies the method from the same test for resampler reader.
+TEST(resampler, timestamp_passthrough_writer) {
+    enum {
+        InSampleRate = 44100,
+        OutSampleRate = 48000,
+        NumCh = 2,
+        ChMask = 0x3,
+        FrameLen = 178
+    };
+    const SampleSpec InSampleSpecs =
+        SampleSpec(InSampleRate, ChanLayout_Surround, ChMask);
+    const SampleSpec OutSampleSpecs =
+        SampleSpec(OutSampleRate, ChanLayout_Surround, ChMask);
+
+    for (size_t n_back = 0; n_back < ResamplerMap::instance().num_backends(); n_back++) {
+        ResamplerBackend backend = ResamplerMap::instance().nth_backend(n_back);
+        core::ScopedPtr<IResampler> resampler(
+            ResamplerMap::instance().new_resampler(backend, arena, buffer_factory,
+                                                   ResamplerProfile_High, InSampleSpecs,
+                                                   OutSampleSpecs),
+            arena);
+
+        const core::nanoseconds_t start_ts = 1691499037871419405;
+        core::nanoseconds_t cur_ts = start_ts;
+        core::nanoseconds_t ts_step;
+
+        // Time Stamp allowance. Built in resampler passess the test with 0.1 --
+        // much better.
+        const core::nanoseconds_t epsilon =
+            core::nanoseconds_t(1. / InSampleRate * core::Second);
+
+        TimestampChecker ts_checker(start_ts, epsilon, OutSampleSpecs);
+
+        ResamplerWriter rwriter(ts_checker, *resampler, buffer_factory, InSampleSpecs,
+                                OutSampleSpecs);
+        // Immediate sample rate.
+        float scale = 1.0f;
+
+        CHECK(rwriter.set_scaling(scale));
+        ts_step = core::nanoseconds_t(InSampleSpecs.samples_overall_2_ns(FrameLen));
+
+        sample_t samples[FrameLen];
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
+                cur_ts = frame.capture_timestamp();
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                cur_ts += ts_step;
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
+            }
+        }
+
+        scale = 0.95f;
+        rwriter.set_scaling(scale);
+        ts_checker.set_scaling(scale);
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                cur_ts += ts_step;
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                cur_ts += ts_step;
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
+            }
+        }
+
+        scale = 1.05f;
+        rwriter.set_scaling(scale);
+        ts_checker.set_scaling(scale);
+        {
+            {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                cur_ts += ts_step;
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
+            }
+            for (size_t i = 0; i < 10; i++) {
+                Frame frame(samples, ROC_ARRAY_SIZE(samples));
+                cur_ts += ts_step;
+                frame.set_capture_timestamp(cur_ts);
+                rwriter.write(frame);
             }
         }
     }

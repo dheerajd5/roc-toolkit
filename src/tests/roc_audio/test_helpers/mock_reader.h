@@ -12,7 +12,6 @@
 #include <CppUTest/TestHarness.h>
 
 #include "roc_audio/iframe_reader.h"
-#include "roc_audio/sample_spec.h"
 #include "roc_core/stddefs.h"
 
 namespace roc {
@@ -21,13 +20,17 @@ namespace test {
 
 class MockReader : public IFrameReader {
 public:
-    MockReader(bool fail_on_empty = true)
-        : pos_(0)
+    explicit MockReader(bool fail_on_empty = true)
+        : total_reads_(0)
+        , pos_(0)
         , size_(0)
-        , fail_on_empty_(fail_on_empty) {
+        , fail_on_empty_(fail_on_empty)
+        , timestamp_(-1) {
     }
 
     virtual bool read(Frame& frame) {
+        total_reads_++;
+
         if (fail_on_empty_) {
             CHECK(pos_ + frame.num_samples() <= size_);
         } else if (pos_ + frame.num_samples() > size_) {
@@ -44,10 +47,21 @@ public:
 
         pos_ += frame.num_samples();
 
+        if (timestamp_ >= 0) {
+            frame.set_capture_timestamp(timestamp_);
+            timestamp_ += sample_spec_.samples_overall_2_ns(frame.num_samples());
+        }
+
         return true;
     }
 
-    void add(size_t size, sample_t value, unsigned flags = 0) {
+    void enable_timestamps(const core::nanoseconds_t base_timestamp,
+                           const SampleSpec& sample_spec) {
+        timestamp_ = base_timestamp;
+        sample_spec_ = sample_spec;
+    }
+
+    void add_samples(size_t size, sample_t value, unsigned flags = 0) {
         CHECK(size_ + size < MaxSz);
 
         for (size_t n = 0; n < size; n++) {
@@ -57,12 +71,16 @@ public:
         }
     }
 
-    void pad_zeros() {
+    void add_zero_samples() {
         while (size_ < MaxSz) {
             samples_[size_] = 0;
             flags_[size_] = 0;
             size_++;
         }
+    }
+
+    size_t total_reads() const {
+        return total_reads_;
     }
 
     size_t num_unread() const {
@@ -72,11 +90,16 @@ public:
 private:
     enum { MaxSz = 64 * 1024 };
 
+    size_t total_reads_;
+
     sample_t samples_[MaxSz];
     unsigned flags_[MaxSz];
     size_t pos_;
     size_t size_;
     const bool fail_on_empty_;
+
+    SampleSpec sample_spec_;
+    core::nanoseconds_t timestamp_;
 };
 
 } // namespace test

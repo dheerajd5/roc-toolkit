@@ -9,6 +9,7 @@
 #include "roc_pipeline/sender_session.h"
 #include "roc_core/log.h"
 #include "roc_core/panic.h"
+#include "roc_core/time.h"
 #include "roc_fec/codec_map.h"
 
 namespace roc {
@@ -91,6 +92,13 @@ bool SenderSession::create_transport_pipeline(SenderEndpoint* source_endpoint,
         pwriter = fec_writer_.get();
     }
 
+    timestamp_extractor_.reset(new (timestamp_extractor_) rtp::TimestampExtractor(
+        *pwriter, format->sample_spec));
+    if (!timestamp_extractor_) {
+        return false;
+    }
+    pwriter = timestamp_extractor_.get();
+
     payload_encoder_.reset(
         format->new_encoder(arena_, format->pcm_format, format->sample_spec), arena_);
     if (!payload_encoder_) {
@@ -171,18 +179,21 @@ audio::IFrameWriter* SenderSession::writer() const {
     return audio_writer_;
 }
 
-core::nanoseconds_t SenderSession::get_update_deadline() const {
-    if (rtcp_session_) {
-        return rtcp_session_->generation_deadline();
+core::nanoseconds_t SenderSession::refresh(core::nanoseconds_t current_time) {
+    if (!rtcp_session_) {
+        return 0;
     }
 
-    return 0;
+    if (timestamp_extractor_ && timestamp_extractor_->has_mapping()) {
+        rtcp_session_->generate_packets(current_time);
+    }
+
+    return rtcp_session_->generation_deadline(current_time);
 }
 
-void SenderSession::update() {
-    if (rtcp_session_) {
-        rtcp_session_->generate_packets();
-    }
+SenderSessionMetrics SenderSession::get_metrics() const {
+    SenderSessionMetrics metrics;
+    return metrics;
 }
 
 size_t SenderSession::on_get_num_sources() {
@@ -205,11 +216,10 @@ packet::source_t SenderSession::on_get_sending_source(size_t source_index) {
 }
 
 rtcp::SendingMetrics
-SenderSession::on_get_sending_metrics(packet::ntp_timestamp_t report_time) {
-    // TODO
-
+SenderSession::on_get_sending_metrics(core::nanoseconds_t report_time) {
     rtcp::SendingMetrics metrics;
-    metrics.origin_ntp = report_time;
+    metrics.origin_time = report_time;
+    metrics.origin_rtp = timestamp_extractor_->get_mapping(report_time);
 
     return metrics;
 }

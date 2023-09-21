@@ -101,6 +101,9 @@ std::tm nanoseconds_2_tm(nanoseconds_t timestamp);
 //!  std::tm has precision of one second.
 nanoseconds_t tm_2_nanoseconds(std::tm tm);
 
+//! Compares a and b if they close enough.
+bool ns_equal_delta(nanoseconds_t a, nanoseconds_t b, nanoseconds_t delta);
+
 } // namespace core
 } // namespace roc
 

@@ -20,6 +20,7 @@
 #include "roc_core/list_node.h"
 #include "roc_core/ref_counted.h"
 #include "roc_packet/packet_factory.h"
+#include "roc_pipeline/metrics.h"
 #include "roc_pipeline/receiver_endpoint.h"
 #include "roc_pipeline/receiver_session_group.h"
 #include "roc_pipeline/receiver_state.h"
@@ -49,14 +50,25 @@ public:
     //! Add endpoint.
     ReceiverEndpoint* add_endpoint(address::Interface iface, address::Protocol proto);
 
-    //! Pull packets from queues and advance session timestamp.
-    void advance(packet::timestamp_t timestamp);
+    //! Pull packets and refresh sessions according to current time.
+    //! @returns
+    //!  deadline (absolute time) when refresh should be invoked again
+    //!  if there are no frames
+    core::nanoseconds_t refresh(core::nanoseconds_t current_time);
 
-    //! Adjust session clock to match consumer clock.
-    void reclock(packet::ntp_timestamp_t timestamp);
+    //! Adjust sessions clock to match consumer clock.
+    //! @remarks
+    //!  @p playback_time specified absolute time when first sample of last frame
+    //!  retrieved from pipeline will be actually played on sink
+    void reclock(core::nanoseconds_t playback_time);
 
     //! Get number of alive sessions.
     size_t num_sessions() const;
+
+    //! Get metrics for slot and its sessions.
+    void get_metrics(ReceiverSlotMetrics& slot_metrics,
+                     ReceiverSessionMetrics* sess_metrics,
+                     size_t* sess_metrics_size) const;
 
 private:
     ReceiverEndpoint* create_source_endpoint_(address::Protocol proto);

@@ -37,6 +37,7 @@ Packetizer::Packetizer(packet::IWriter& writer,
     source_ = (packet::source_t)core::fast_random(0, packet::source_t(-1));
     seqnum_ = (packet::seqnum_t)core::fast_random(0, packet::seqnum_t(-1));
     timestamp_ = (packet::timestamp_t)core::fast_random(0, packet::timestamp_t(-1));
+    capture_ts_ = 0;
     valid_ = true;
     roc_log(LogDebug, "packetizer: initializing: n_channels=%lu samples_per_packet=%lu",
             (unsigned long)sample_spec_.num_channels(),
@@ -54,6 +55,7 @@ void Packetizer::write(Frame& frame) {
 
     const sample_t* buffer_ptr = frame.samples();
     size_t buffer_samples = frame.num_samples() / sample_spec_.num_channels();
+    capture_ts_ = frame.capture_timestamp();
 
     while (buffer_samples != 0) {
         if (!packet_) {
@@ -72,6 +74,9 @@ void Packetizer::write(Frame& frame) {
         buffer_samples -= n_encoded;
 
         packet_pos_ += n_encoded;
+        if (capture_ts_) {
+            capture_ts_ += sample_spec_.samples_per_chan_2_ns(n_encoded);
+        }
 
         if (packet_pos_ == samples_per_packet_) {
             end_packet_();
@@ -101,6 +106,7 @@ bool Packetizer::begin_packet_() {
     rtp->source = source_;
     rtp->seqnum = seqnum_;
     rtp->timestamp = timestamp_;
+    rtp->capture_timestamp = capture_ts_;
     rtp->payload_type = payload_type_;
 
     packet_ = pp;

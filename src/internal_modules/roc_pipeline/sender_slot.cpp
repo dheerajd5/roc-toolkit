@@ -111,12 +111,18 @@ bool SenderSlot::is_complete() const {
     return session_.writer();
 }
 
-core::nanoseconds_t SenderSlot::get_update_deadline() const {
-    return session_.get_update_deadline();
+core::nanoseconds_t SenderSlot::refresh(core::nanoseconds_t current_time) {
+    return session_.refresh(current_time);
 }
 
-void SenderSlot::update() {
-    session_.update();
+void SenderSlot::get_metrics(SenderSlotMetrics& slot_metrics,
+                             SenderSessionMetrics* sess_metrics) const {
+    slot_metrics = SenderSlotMetrics();
+    slot_metrics.is_complete = is_complete();
+
+    if (sess_metrics) {
+        *sess_metrics = session_.get_metrics();
+    }
 }
 
 SenderEndpoint*
